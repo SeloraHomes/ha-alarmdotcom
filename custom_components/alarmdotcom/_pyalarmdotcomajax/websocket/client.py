@@ -393,7 +393,15 @@ class WebSocketClient:
             await asyncio.sleep(KEEP_ALIVE_SIGNAL_INTERVAL_S)
 
             # Don't send requests if websocket client is disconnected.
-            if self.state != WebSocketState.CONNECTED:
+            #
+            # `connected`, not `state == CONNECTED`: the event reader reports
+            # CONNECTED only for the very first connection and RECONNECTED for
+            # every one after that, and never returns to CONNECTED (see
+            # _event_reader). Comparing against CONNECTED alone therefore
+            # silenced the keep-alive permanently from the first reconnect
+            # onward, leaving the Alarm.com session to idle out and every later
+            # request to depend on the bridge's login-repair path.
+            if not self.connected:
                 log.debug("[KEEP ALIVE] Skipping keep alive.")
                 signals_sent = 0
                 continue
