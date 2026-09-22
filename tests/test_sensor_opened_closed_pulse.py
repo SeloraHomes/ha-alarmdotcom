@@ -30,7 +30,9 @@ from _pyalarmdotcomajax.controllers.sensors import (
     SENSOR_EVENT_STATE_MAP,
     SensorController,
 )
+from _pyalarmdotcomajax.models.jsonapi import Resource
 from _pyalarmdotcomajax.models.sensor import Sensor, SensorState, SensorSubtype
+from _pyalarmdotcomajax.websocket.client import RawResourceEventMessage
 from _pyalarmdotcomajax.websocket.messages import EventWSMessage, ResourceEventType
 
 
@@ -55,6 +57,8 @@ def _controller(resource: Sensor) -> SensorController:
     """Build a controller real enough to run the pulse, faked everywhere else."""
     controller = MagicMock(spec=SensorController)
     controller._opened_closed_pulses = {}
+    # Created in BaseController.__init__, so not part of the class spec.
+    controller._background_tasks = set()
     controller.get = MagicMock(return_value=resource)
     controller._register_or_update_resource = AsyncMock(return_value=None)
 
@@ -65,13 +69,15 @@ def _controller(resource: Sensor) -> SensorController:
         )
     )
     controller._schedule_opened_closed_settle = (
-        lambda resource_id, settled: SensorController._schedule_opened_closed_settle(
-            controller, resource_id, settled
+        lambda resource_id, settled, opened: (
+            SensorController._schedule_opened_closed_settle(
+                controller, resource_id, settled, opened
+            )
         )
     )
     controller._settle_opened_closed = (
-        lambda resource_id, settled: SensorController._settle_opened_closed(
-            controller, resource_id, settled
+        lambda resource_id, settled, opened: SensorController._settle_opened_closed(
+            controller, resource_id, settled, opened
         )
     )
 
@@ -197,3 +203,170 @@ async def test_pulse_defers_to_a_state_set_elsewhere(
     await asyncio.sleep(0)
 
     controller._register_or_update_resource.assert_not_awaited()
+
+
+#
+# End-to-end through the controller's real event path.
+#
+# The tests above drive _handle_event directly with mocks, which cannot show
+# what subscribers actually see. These build a real Sensor from a real JSON:API
+# Resource and go through _base_handle_event, so the published state is the
+# thing being asserted.
+#
+
+
+def _real_sensor_resource() -> Resource:
+    """
+    Build a JSON:API resource for the front door.
+
+    Attributes are the real payload from that sensor's diagnostics, not a
+    hand-picked subset: the model requires most of them, and a trimmed stub
+    would only prove that the stub parses.
+    """
+    return Resource(
+        id="94927580-2",
+        type="devices/sensor",
+        attributes={
+            "addDeviceResource": 0,
+            "associatedCameraDeviceIds": {},
+            "batteryLevelClassification": None,
+            "batteryLevelNull": None,
+            "canAccessAppSettings": False,
+            "canAccessTroubleshootingWizard": False,
+            "canAccessWebSettings": True,
+            "canBeAssociatedToVideoDevice": True,
+            "canBeDeleted": False,
+            "canBeRenamed": True,
+            "canBeSaved": True,
+            "canChangeDescription": True,
+            "canConfirmStateChange": True,
+            "canReceiveCommands": False,
+            "description": 'Front Door',
+            "desiredState": 1,
+            "deviceIcon": {'icon': 317},
+            "deviceModelId": 110,
+            "deviceRole": 0,
+            "deviceType": 1,
+            "displayStateText": 'Closed',
+            "hasPermissionToChangeState": True,
+            "hasState": True,
+            "isAssignedToCareReceiver": False,
+            "isBypassed": False,
+            "isFlexIo": False,
+            "isMalfunctioning": False,
+            "isMatter": False,
+            "isMonitoringEnabled": True,
+            "isOAuth": False,
+            "isZWave": False,
+            "isZWaveWakeupNode": False,
+            "macAddress": '',
+            "managedDeviceType": 14,
+            "manufacturer": None,
+            "matterAssociatedIdToNameMap": None,
+            "matterParentNodeId": None,
+            "openClosedStatus": 2,
+            "primaryAssociatedDeviceIds": None,
+            "remoteCommandsEnabled": True,
+            "sensorNamingFormat": 3,
+            "showDeletionMessage": False,
+            "state": 1,
+            "supportsBypass": True,
+            "supportsCommandClassBasic": False,
+            "supportsImmediateBypass": True,
+            "troubleshootingWizard": None,
+            "unitSupportsRemovingWakeupNode": False,
+            "webSettings": 159,
+        },
+    )
+
+
+async def _controller_with_real_resource(
+    resource: Resource,
+) -> tuple[SensorController, list]:
+    """Build a SensorController holding one real sensor, capturing publishes."""
+    published: list = []
+
+    bridge = MagicMock()
+    bridge.events.publish = published.append
+
+    controller = SensorController(bridge)
+    await controller._register_or_update_resource(resource)
+    published.clear()  # drop the registration event
+
+    return controller, published
+
+
+def _raw_event(subtype: ResourceEventType) -> EventWSMessage:
+    """Build a websocket event message addressed at the sensor above."""
+    return EventWSMessage.from_dict(
+        {
+            "unit_id": "94927580",
+            "device_id": 2,
+            "event_type": subtype.value,
+            "event_value": 0.0,
+            "event_date_utc": "2026-09-22T16:28:00.077Z",
+            "qstring_for_extra_data": None,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_open_is_published_before_the_pulse_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Subscribers see Open immediately, then Closed - two separate updates."""
+    monkeypatch.setattr(
+        "_pyalarmdotcomajax.controllers.sensors.OPENED_CLOSED_PULSE_S", 0
+    )
+
+    resource = _real_sensor_resource()
+    controller, published = await _controller_with_real_resource(resource)
+
+    await controller._base_handle_event(
+        RawResourceEventMessage(ws_message=_raw_event(ResourceEventType.OpenedClosed))
+    )
+
+    assert [m.resource.attributes.state for m in published] == [SensorState.OPEN]
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert [m.resource.attributes.state for m in published] == [
+        SensorState.OPEN,
+        SensorState.CLOSED,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_during_the_pulse_is_not_overwritten(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A refresh landing mid-pulse wins, even when it also says "open".
+
+    The pulse timer only speaks for the open it wrote itself. A refresh builds
+    a new Resource from the API payload, so identity - not the state value -
+    is what tells them apart: a door that is genuinely still open must not be
+    slammed shut by a timer from two seconds ago.
+    """
+    monkeypatch.setattr(
+        "_pyalarmdotcomajax.controllers.sensors.OPENED_CLOSED_PULSE_S", 0
+    )
+
+    resource = _real_sensor_resource()
+    controller, _ = await _controller_with_real_resource(resource)
+
+    await controller._base_handle_event(
+        RawResourceEventMessage(ws_message=_raw_event(ResourceEventType.OpenedClosed))
+    )
+
+    # A full-state refresh arrives, reporting the door as genuinely open.
+    refreshed = _real_sensor_resource()
+    refreshed.attributes["state"] = SensorState.OPEN.value
+    refreshed.attributes["description"] = "Front Door (refreshed)"
+    await controller._register_or_update_resource(refreshed)
+
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert controller.get("94927580-2").attributes.state == SensorState.OPEN

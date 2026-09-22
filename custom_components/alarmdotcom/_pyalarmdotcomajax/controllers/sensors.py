@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from _pyalarmdotcomajax.const import ATTR_DESIRED_STATE, ATTR_STATE
 from _pyalarmdotcomajax.controllers.base import BaseController, device_controller
 from _pyalarmdotcomajax.models.base import ResourceType
+from _pyalarmdotcomajax.models.jsonapi import Resource
 from _pyalarmdotcomajax.models.sensor import Sensor, SensorState, SensorSubtype
 from _pyalarmdotcomajax.websocket.client import SupportedResourceEvents
 from _pyalarmdotcomajax.websocket.messages import (
@@ -142,6 +143,7 @@ class SensorController(BaseController[Sensor]):
                         SensorState.IDLE
                         if adc_resource.subtype == SensorSubtype.MOTION_SENSOR
                         else SensorState.CLOSED,
+                        adc_resource.api_resource,
                     )
 
             #
@@ -173,15 +175,19 @@ class SensorController(BaseController[Sensor]):
             task.cancel()
 
     def _schedule_opened_closed_settle(
-        self, resource_id: str, settled_state: SensorState
+        self, resource_id: str, settled_state: SensorState, opened: Resource
     ) -> None:
         """Settle a momentary open back to closed after the pulse elapses."""
         if self._opened_closed_pulses is None:
             return
 
         task = asyncio.create_task(
-            self._settle_opened_closed(resource_id, settled_state)
+            self._settle_opened_closed(resource_id, settled_state, opened)
         )
+        # Tracked alongside the controller's other background work, so a pulse
+        # in flight is at least visible to anything inspecting the controller.
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
         self._opened_closed_pulses[resource_id] = task
 
         def _forget(finished: asyncio.Task) -> None:
@@ -194,7 +200,7 @@ class SensorController(BaseController[Sensor]):
         task.add_done_callback(_forget)
 
     async def _settle_opened_closed(
-        self, resource_id: str, settled_state: SensorState
+        self, resource_id: str, settled_state: SensorState, opened: Resource
     ) -> None:
         """Write the closed half of an OpenedClosed event and publish it."""
         await asyncio.sleep(OPENED_CLOSED_PULSE_S)
@@ -204,9 +210,15 @@ class SensorController(BaseController[Sensor]):
         if adc_resource is None:
             return
 
-        # Only settle a sensor this pulse actually opened. A refresh or another
-        # event may have moved it somewhere else entirely while we waited, and
-        # that newer truth wins.
+        # Only settle the open this pulse itself wrote. Registering an event
+        # re-wraps the same underlying Resource, so identity still holds across
+        # our own update - but a refresh builds a new one from the API payload,
+        # and that newer truth wins even when it happens to say "open" too.
+        # Without this check a refresh landing inside the pulse window would be
+        # overwritten by a timer that no longer speaks for the device.
+        if adc_resource.api_resource is not opened:
+            return
+
         if adc_resource.attributes.state not in (SensorState.OPEN, SensorState.ACTIVE):
             return
 
