@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import random
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -222,6 +223,11 @@ class WebSocketClient:
             try:
                 await self._authenticate()
 
+                # The clock starts here, not after the handshake: the server
+                # dates the token from when it issued it, so a slow connect
+                # eats into the lifetime rather than extending it.
+                token_issued_at = time.monotonic()
+
                 log.info("[EVENT READER] Connecting to Alarm.com WebSocket endpoint...")
 
                 token_expired = False
@@ -237,10 +243,22 @@ class WebSocketClient:
                     # Leaving this block for any reason closes the connection,
                     # so the deadline is what ends the session - deliberately,
                     # before the server would.
+                    remaining = WS_TOKEN_LIFETIME_S - (
+                        time.monotonic() - token_issued_at
+                    )
+
                     try:
-                        async with asyncio.timeout(WS_TOKEN_LIFETIME_S):
+                        async with asyncio.timeout(max(remaining, 0)) as deadline:
                             await self._read_messages(websocket)
                     except TimeoutError:
+                        # Only ours counts as planned. A TimeoutError raised by
+                        # the read itself is a real failure and has to keep the
+                        # backoff, or a socket that times out on every read
+                        # becomes a tight reconnect loop hammering the token
+                        # endpoint.
+                        if not deadline.expired():
+                            raise
+
                         token_expired = True
                         log.debug(
                             "[EVENT READER] Replacing the connection before its token expires."

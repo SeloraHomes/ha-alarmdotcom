@@ -20,6 +20,8 @@ import custom_components.alarmdotcom  # noqa: F401
 
 import asyncio
 import contextlib
+import itertools
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -118,6 +120,93 @@ def test_deadline_leaves_margin_under_the_observed_expiry() -> None:
     shortest_observed_expiry_s = 5 * 60 + 8
 
     assert shortest_observed_expiry_s - 30 > ws_client.WS_TOKEN_LIFETIME_S
+
+
+@pytest.mark.asyncio
+async def test_a_slow_handshake_eats_into_the_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The token is already ageing while the handshake runs.
+
+    Starting the deadline after the handshake instead would hand the
+    connection a full fresh lifetime, so a slow connect would push the
+    replacement past the server's own expiry - the 1008 close this pre-empts.
+    The tell is timing: with the budget spent on the handshake, the
+    replacement follows immediately instead of a whole lifetime later.
+    """
+    lifetime = 0.20
+    handshake = lifetime + 0.05
+    monkeypatch.setattr(ws_client, "WS_TOKEN_LIFETIME_S", lifetime)
+
+    client = WebSocketClient(MagicMock())
+    client._authenticate = AsyncMock(return_value=None)
+
+    handshakes: list[float] = []
+
+    @contextlib.asynccontextmanager
+    async def slow_ws_connect(_url: str, **_kwargs: object):
+        handshakes.append(time.monotonic())
+
+        if len(handshakes) > 2:
+            raise _StopReader
+
+        await asyncio.sleep(handshake)
+
+        socket = MagicMock()
+        socket.close_code = None
+        yield socket
+
+    client._bridge.ws_connect = slow_ws_connect
+
+    async def blocks_forever(_socket: object) -> None:
+        await asyncio.sleep(3600)
+
+    client._read_messages = blocks_forever
+
+    with pytest.raises(_StopReader):
+        await client._event_reader()
+
+    assert len(handshakes) == 3
+
+    # Each connection is replaced as soon as the handshake finishes, because
+    # the handshake alone outlived the token. Timing the deadline from after
+    # the handshake would add a further `lifetime` of reading to each round.
+    for first, second in itertools.pairwise(handshakes):
+        assert second - first < handshake + lifetime / 2
+
+
+@pytest.mark.asyncio
+async def test_a_read_timeout_is_not_treated_as_a_planned_replacement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A TimeoutError from the read itself must take the failure path.
+
+    Classifying it as planned resets the attempt counter and skips the backoff,
+    so a socket that times out on every read becomes a tight reconnect loop
+    hammering Alarm.com's token endpoint. DISCONNECTED is the tell: the planned
+    replacement never emits it.
+    """
+    monkeypatch.setattr(ws_client, "WS_TOKEN_LIFETIME_S", 3600)
+    # Backoff of zero, so the test does not actually wait one out.
+    monkeypatch.setattr(ws_client.random, "random", lambda: 0.0)
+
+    connects: list[str] = []
+    client = _client_with_fake_socket(connects, connect_limit=1)
+
+    async def times_out(_socket: object) -> None:
+        raise TimeoutError
+
+    client._read_messages = times_out
+
+    emitted: list[WebSocketState] = []
+    client._emit_ws_state = lambda state, next_attempt_s=None: emitted.append(state)
+
+    with pytest.raises(_StopReader):
+        await client._event_reader()
+
+    assert WebSocketState.DISCONNECTED in emitted
 
 
 @pytest.mark.asyncio
