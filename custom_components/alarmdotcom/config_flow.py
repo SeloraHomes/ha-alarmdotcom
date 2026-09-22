@@ -43,6 +43,40 @@ LOGGER = logging.getLogger(__name__)
 LegacyArmingOptions = Literal["home", "away", "true", "false"]
 
 
+MASK_CHAR = "•"
+
+
+def _mask_phone_number(number: str) -> str:
+    """
+    Mask all but the last four digits of a phone number.
+
+    Enough for the user to recognize which of their numbers Alarm.com holds
+    on file - the point of showing it at all - without reprinting the whole
+    number on screen. Non-digits (formatting) are preserved so the number
+    keeps its familiar shape.
+    """
+    chars = list(number)
+    digit_positions = [i for i, char in enumerate(chars) if char.isdigit()]
+
+    for position in digit_positions[:-4]:
+        chars[position] = MASK_CHAR
+
+    return "".join(chars)
+
+
+def _mask_email(email: str) -> str:
+    """
+    Mask the local part of an email address, keeping the domain readable.
+
+    A value without an "@" is not an address we recognize, so it is masked
+    whole rather than printed verbatim.
+    """
+    local, separator, domain = email.partition("@")
+    masked_local = local[:1] + MASK_CHAR * max(len(local) - 1, 1)
+
+    return f"{masked_local}@{domain}" if separator else masked_local
+
+
 class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle an Alarmdotcom config flow."""
 
@@ -73,10 +107,23 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
+            # Reuse the device-trust token from the entry being reauthenticated.
+            # It is what tells Alarm.com this device was already verified, so
+            # carrying it over means an expired session is repaired with just a
+            # password - without it every reauth looked like a brand-new device
+            # and forced a fresh OTP (and, with SMS, a fresh text message that
+            # may never arrive). A stale or rejected token costs nothing: the
+            # login simply reports the device as untrusted and we fall through
+            # to the normal OTP steps below.
             self.config = {
                 CONF_USERNAME: user_input[CONF_USERNAME],
                 CONF_PASSWORD: user_input[CONF_PASSWORD],
-                CONF_MFA_TOKEN: user_input.get(CONF_MFA_TOKEN),
+                CONF_MFA_TOKEN: user_input.get(CONF_MFA_TOKEN)
+                or (
+                    self._existing_entry.data.get(CONF_MFA_TOKEN)
+                    if self._existing_entry
+                    else None
+                ),
             }
 
             LOGGER.debug("Logging in to Alarm.com...")
@@ -92,6 +139,13 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     await self.bridge.login()
                 except pyadc.OtpRequired as exc:
                     LOGGER.debug("OTP code required. Moving to selection step.")
+                    # Reaching this step proves the carried-over token did not
+                    # get us in, so drop it. submit_otp() only checks that *a*
+                    # cookie exists when deciding the OTP succeeded, so leaving
+                    # the dead one in place would let it pass that check and
+                    # save the same dead token straight back to the entry.
+                    self.config[CONF_MFA_TOKEN] = None
+                    self.bridge.auth_controller.mfa_cookie = ""
                     self._otp_options = exc
                     return await self.async_step_otp_select_method()
                 except pyadc.MustConfigureMfa:
@@ -135,6 +189,71 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             errors=errors,
             last_step=False,
         )
+
+    def _otp_destination_value(self, method: pyadc.OtpType | None) -> str | None:
+        """
+        Return the masked phone number or email address Alarm.com holds for this method.
+
+        Alarm.com reports both on the OtpRequired exception, but the user never
+        saw either, which made an undeliverable destination - a decommissioned
+        number, or a VoIP line that silently drops SMS - look like a broken
+        integration rather than an account setting to fix.
+        """
+        if not self._otp_options:
+            return None
+
+        if method == pyadc.OtpType.sms:
+            number = (
+                self._otp_options.formatted_sms_number or self._otp_options.sms_number
+            )
+            return _mask_phone_number(number) if number else None
+
+        if method == pyadc.OtpType.email:
+            return _mask_email(self._otp_options.email) if self._otp_options.email else None
+
+        return None
+
+    def _otp_destination(self, method: pyadc.OtpType | None) -> str:
+        """Complete the code-entry screen's "Enter the one-time code {destination}."."""
+        destination = self._otp_destination_value(method)
+
+        if method == pyadc.OtpType.app:
+            return "from your authenticator app"
+
+        if method == pyadc.OtpType.sms:
+            return (
+                f"sent by text message to {destination}"
+                if destination
+                else "sent by text message"
+            )
+
+        if method == pyadc.OtpType.email:
+            return f"sent by email to {destination}" if destination else "sent by email"
+
+        return "sent to you by Alarm.com"
+
+    def _otp_destination_summary(self, methods: list[pyadc.OtpType]) -> str:
+        """List each offered delivery method alongside where its code would go."""
+        labels = {
+            pyadc.OtpType.app: "Authenticator app",
+            pyadc.OtpType.sms: "Text message",
+            pyadc.OtpType.email: "Email",
+        }
+
+        lines = []
+        for method in methods:
+            label = labels.get(method, method.name)
+
+            if method == pyadc.OtpType.app:
+                lines.append(f"{label}: code generated in the app")
+                continue
+
+            lines.append(
+                f"{label}: "
+                f"{self._otp_destination_value(method) or 'destination not reported by Alarm.com'}"
+            )
+
+        return "\n".join(lines)
 
     async def async_step_otp_select_method(
         self, user_input: dict[str, Any] | None = None
@@ -214,6 +333,9 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="otp_select_method",
             data_schema=otp_method_schema,
             errors=errors,
+            description_placeholders={
+                "destinations": self._otp_destination_summary(enabled_methods)
+            },
             last_step=False,
         )
 
@@ -271,6 +393,9 @@ class ADCFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             step_id="otp_submit",
             data_schema=creds_schema,
             errors=errors,
+            description_placeholders={
+                "destination": self._otp_destination(self.otp_method)
+            },
             last_step=True,
         )
 

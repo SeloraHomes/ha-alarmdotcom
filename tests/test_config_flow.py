@@ -19,12 +19,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 import custom_components.alarmdotcom._pyalarmdotcomajax as pyadc
 from custom_components.alarmdotcom.const import (
-    CONF_CAMERA_TOKEN_REFRESH_INTERVAL,
-    CONF_OPTIONS_DEFAULT,
     CONF_ARM_AWAY,
     CONF_ARM_CODE,
     CONF_ARM_HOME,
     CONF_ARM_NIGHT,
+    CONF_CAMERA_TOKEN_REFRESH_INTERVAL,
+    CONF_MFA_TOKEN,
+    CONF_OPTIONS_DEFAULT,
     CONF_OTP,
     CONF_OTP_METHOD,
     CONF_REMOVE_ARM_CODE,
@@ -172,6 +173,166 @@ async def test_otp_flow_auto_skips_method_selection_for_app_only(
     assert result["type"] == data_entry_flow.FlowResultType.FORM
     assert result["step_id"] == "otp_submit"
     mock_bridge.auth_controller.request_otp.assert_not_awaited()
+
+
+async def test_otp_method_selection_shows_masked_destinations(
+    hass: HomeAssistant, mock_bridge_class, mock_bridge
+) -> None:
+    """
+    The method picker names where each code would actually go.
+
+    Without this the picker just said "Text Message", so a number Alarm.com
+    can't deliver to (a decommissioned line, or a VoIP number that silently
+    drops SMS) was indistinguishable from a broken integration.
+    """
+    mock_bridge.login = AsyncMock(
+        side_effect=pyadc.OtpRequired(
+            enabled_2fa_methods=[pyadc.OtpType.sms, pyadc.OtpType.email],
+            email="test@example.com",
+            sms_number="5555550123",
+            sms_country_code="1",
+        )
+    )
+
+    result = await _start_user_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], VALID_CREDS
+    )
+
+    assert result["step_id"] == "otp_select_method"
+    destinations = result["description_placeholders"]["destinations"]
+
+    assert "0123" in destinations
+    assert "t•••@example.com" in destinations
+    # Only the last four digits survive masking.
+    assert sum(char.isdigit() for char in destinations) == 4
+
+
+async def test_otp_submit_names_the_sms_destination(
+    hass: HomeAssistant, mock_bridge_class, mock_bridge
+) -> None:
+    """The code-entry screen says which number the text was sent to."""
+    mock_bridge.login = AsyncMock(
+        side_effect=pyadc.OtpRequired(
+            enabled_2fa_methods=[pyadc.OtpType.sms],
+            sms_number="5555550123",
+            sms_country_code="1",
+        )
+    )
+
+    result = await _start_user_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], VALID_CREDS
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_OTP_METHOD: "sms"}
+    )
+
+    assert result["step_id"] == "otp_submit"
+    destination = result["description_placeholders"]["destination"]
+    assert destination.startswith("sent by text message to ")
+    assert destination.endswith("0123")
+
+
+async def test_otp_submit_does_not_claim_a_code_was_sent_for_app_only(
+    hass: HomeAssistant, mock_bridge_class, mock_bridge
+) -> None:
+    """
+    Nothing is sent for the authenticator-app method, so don't say it was.
+
+    The old wording ("the one-time code sent to your chosen device") had users
+    waiting on a text message that was never requested.
+    """
+    mock_bridge.login = AsyncMock(
+        side_effect=pyadc.OtpRequired(enabled_2fa_methods=[pyadc.OtpType.app])
+    )
+
+    result = await _start_user_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], VALID_CREDS
+    )
+
+    assert result["step_id"] == "otp_submit"
+    assert (
+        result["description_placeholders"]["destination"]
+        == "from your authenticator app"
+    )
+
+
+async def test_reauth_reuses_stored_mfa_token(
+    hass: HomeAssistant, mock_bridge_class, mock_bridge, mock_setup_entry
+) -> None:
+    """
+    Reauth logs back in with the entry's device-trust token.
+
+    That token is what tells Alarm.com the device was already verified.
+    Dropping it made every reauth look like a brand-new device and forced a
+    fresh OTP - and with SMS, a fresh text that may never arrive.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="12345",
+        data={**VALID_CREDS, CONF_MFA_TOKEN: "stored-token"},
+    )
+    entry.add_to_hass(hass)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], VALID_CREDS
+    )
+
+    assert mock_bridge_class.call_args.kwargs["mfa_token"] == "stored-token"
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert result["reason"] == "reauth_successful"
+    assert entry.data[CONF_MFA_TOKEN] == "stored-token"
+
+
+async def test_reauth_discards_a_rejected_mfa_token(
+    hass: HomeAssistant, mock_bridge_class, mock_bridge, mock_setup_entry
+) -> None:
+    """
+    A carried-over token that still needs an OTP is dropped, not saved back.
+
+    submit_otp() decides the OTP succeeded by checking that the controller
+    holds any MFA cookie at all, so a dead token left in place would pass that
+    check and be written straight back to the entry - leaving the user in a
+    loop of reauths that each demand a fresh code.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        unique_id="12345",
+        data={**VALID_CREDS, CONF_MFA_TOKEN: "stale-token"},
+    )
+    entry.add_to_hass(hass)
+
+    mock_bridge.auth_controller.mfa_cookie = "stale-token"
+    mock_bridge.login = AsyncMock(
+        side_effect=pyadc.OtpRequired(enabled_2fa_methods=[pyadc.OtpType.app])
+    )
+    mock_bridge.auth_controller.submit_otp = AsyncMock(return_value="fresh-token")
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": config_entries.SOURCE_REAUTH, "entry_id": entry.entry_id},
+        data=entry.data,
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], VALID_CREDS
+    )
+
+    assert result["step_id"] == "otp_submit"
+    assert mock_bridge.auth_controller.mfa_cookie == ""
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {CONF_OTP: "123456"}
+    )
+
+    assert result["type"] == data_entry_flow.FlowResultType.ABORT
+    assert entry.data[CONF_MFA_TOKEN] == "fresh-token"
 
 
 async def test_invalid_otp_code_shows_error(

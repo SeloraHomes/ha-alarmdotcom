@@ -14,13 +14,14 @@
             },
             "otp_submit": {
                 "title": "Enter One-Time Password",
-                "description": "If you used the SMS or email authentication methods, an OTP has already been sent to your inbox.",
+                "description": "Enter the one-time code {destination}.",
                 "data": {
                     "otp": "One-Time Password"
                 }
             },
             "otp_select_method": {
                 "title": "Select Two Factor Authentication Method",
+                "description": "Alarm.com requires a security code. Choose how it should be sent:\n\n{destinations}",
                 "data": { "otp_method": "Method" }
             }
         },
@@ -28,11 +29,14 @@
             "cannot_connect": "[%key:common::config_flow::error::cannot_connect%]",
             "invalid_auth": "[%key:common::config_flow::error::invalid_auth%]",
             "unknown": "[%key:common::config_flow::error::unknown%]",
-            "invalid_otp": "Invalid one-time password."
+            "invalid_otp": "Invalid one-time password.",
+            "invalid_otp_method": "The selected delivery method is not supported."
         },
         "abort": {
             "reauth_successful": "[%key:common::config_flow::abort::reauth_successful%]",
-            "must_enable_2fa": "Two-factor authentication must be enabled in order to log in with this provider."
+            "must_enable_2fa": "Two-factor authentication must be enabled in order to log in with this provider.",
+            "no_otp_options": "No valid multi-factor authentication methods were found for this account.",
+            "otp_method_lost": "The selected verification method is no longer valid. Please try again."
         }
     },
     "options": {
