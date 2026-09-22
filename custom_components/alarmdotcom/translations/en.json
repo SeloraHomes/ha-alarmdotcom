@@ -23,14 +23,14 @@
             },
             "otp_select_method": {
                 "title": "Verification Method",
-                "description": "Alarm.com requires a security code. How should we send it?",
+                "description": "Alarm.com requires a security code. Choose how it should be sent:\n\n{destinations}",
                 "data": {
                     "otp_method": "Delivery Method"
                 }
             },
             "otp_submit": {
                 "title": "Verify Your Identity",
-                "description": "Please enter the one-time code sent to your chosen device.",
+                "description": "Enter the one-time code {destination}.",
                 "data": {
                     "otp": "Security Code"
                 }
