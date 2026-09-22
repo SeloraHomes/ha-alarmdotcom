@@ -57,6 +57,14 @@ MAX_RECONNECT_WAIT_S = 30 * 60
 # So replace the connection before the server expires it, on our own schedule
 # and with a fresh token, rather than waiting to be kicked off.
 WS_TOKEN_LIFETIME_S = 4 * 60 + 30
+
+# How long to wait for the websocket handshake before giving up on it.
+# Connections to webskt.alarm.com sometimes hang instead of failing: measured
+# on a live system, a stalled attempt took 30.4 seconds to raise, and it
+# happens to planned replacements too, not just reconnects after a kick. With
+# no timeout of our own that is 30 seconds of lost events for a connection we
+# could have retried in two. A successful handshake there takes ~150ms.
+WS_CONNECT_TIMEOUT_S = 10
 DEFAULT_SIGNALS_PER_SESSION_REFRESH = 1
 MAX_CONNECTION_ATTEMPTS = 25
 
@@ -232,7 +240,16 @@ class WebSocketClient:
 
                 token_expired = False
 
-                async with self._bridge.ws_connect(f"{self._ws_endpoint}/?f=1&auth={self._token}") as websocket:
+                async with contextlib.AsyncExitStack() as connection:
+                    # Only the handshake is under this timeout - wrapping the
+                    # whole block would cap the connection's lifetime instead.
+                    async with asyncio.timeout(WS_CONNECT_TIMEOUT_S):
+                        websocket = await connection.enter_async_context(
+                            self._bridge.ws_connect(
+                                f"{self._ws_endpoint}/?f=1&auth={self._token}"
+                            )
+                        )
+
                     self._set_state(
                         WebSocketState.CONNECTED if connect_attempts == 1 else WebSocketState.RECONNECTED,
                     )
