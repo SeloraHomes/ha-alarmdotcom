@@ -42,6 +42,20 @@ ALL_TOKEN_T = Literal["*"]
 
 KEEP_ALIVE_SIGNAL_INTERVAL_S = 60
 MAX_RECONNECT_WAIT_S = 30 * 60
+
+# Alarm.com's websocket token is short-lived: the server closes the connection
+# with code 1008 ("rejected token") about five minutes after it is issued.
+# Measured on a live system, uptimes were 5m08s, 5m11s, 5m15s, 5m28s and 5m54s
+# across forty minutes - a metronome, not network trouble. Recovering from the
+# kick took up to 2m38s because the first attempts to reconnect hang and time
+# out, leaving the integration blind for roughly a third of its life and losing
+# every event that arrived meanwhile (a websocket has no replay, and the
+# periodic API refresh only reports current state - a door opened and closed
+# during the gap is gone for good).
+#
+# So replace the connection before the server expires it, on our own schedule
+# and with a fresh token, rather than waiting to be kicked off.
+WS_TOKEN_LIFETIME_S = 4 * 60 + 30
 DEFAULT_SIGNALS_PER_SESSION_REFRESH = 1
 MAX_CONNECTION_ATTEMPTS = 25
 
@@ -210,6 +224,8 @@ class WebSocketClient:
 
                 log.info("[EVENT READER] Connecting to Alarm.com WebSocket endpoint...")
 
+                token_expired = False
+
                 async with self._bridge.ws_connect(f"{self._ws_endpoint}/?f=1&auth={self._token}") as websocket:
                     self._set_state(
                         WebSocketState.CONNECTED if connect_attempts == 1 else WebSocketState.RECONNECTED,
@@ -218,35 +234,38 @@ class WebSocketClient:
 
                     log.info("[EVENT READER] Connected to WebSocket")
 
-                    async for msg in websocket:
-                        if msg.type == aiohttp.WSMsgType.CLOSED:
-                            log.info(
-                                "[EVENT READER]aiohttp WebSocket connection closed: Code: %s, Message: '%s'",
-                                msg.data,
-                                msg.extra,
-                            )
-                            continue
+                    # Leaving this block for any reason closes the connection,
+                    # so the deadline is what ends the session - deliberately,
+                    # before the server would.
+                    try:
+                        async with asyncio.timeout(WS_TOKEN_LIFETIME_S):
+                            await self._read_messages(websocket)
+                    except TimeoutError:
+                        token_expired = True
+                        log.debug(
+                            "[EVENT READER] Replacing the connection before its token expires."
+                        )
 
-                        if msg.type == aiohttp.WSMsgType.ERROR:
-                            log.info("[EVENT READER]aiohttp WebSocket error: '%s'", msg.data)
-                            continue
-
-                        if msg.type != aiohttp.WSMsgType.TEXT:
-                            log.debug(
-                                "[EVENT READER]Got non-text WebSocket message: '%s'",
-                                msg.data,
-                            )
-                            continue
-
-                        self._event_queue.put_nowait(msg.data)
-                        self._event_history.append(msg.data)
+                if token_expired:
+                    # A planned replacement, not a failure: reconnect at once,
+                    # with no backoff and no attempt counted against the limit.
+                    # Zero rather than leave it at one, because the loop counts
+                    # the coming attempt as it starts - leaving it would make
+                    # the fresh connection report RECONNECTED, and every
+                    # controller would run a full reconnect refresh on our own
+                    # timer. Downstream sees no interruption, because as far as
+                    # it is concerned there wasn't one.
+                    connect_attempts = 0
+                    continue
 
                 if log.isEnabledFor(logging.DEBUG):
                     close_code: aiohttp.WSCloseCode | int | None = websocket.close_code
                     with contextlib.suppress(AttributeError):
                         if websocket.close_code:
-                            # TODO: Close code 1008 means rejected token. Adc web portal initiated immediate
-                            # reconnect.
+                            # 1008 here means the server rejected our token - the
+                            # expiry that WS_TOKEN_LIFETIME_S now pre-empts. Seeing
+                            # it again means the server's lifetime got shorter than
+                            # ours, and that constant should come down.
                             close_code = aiohttp.WSCloseCode(int(websocket.close_code))
 
                     log.debug("[EVENT READER] WebSocket Connection Closed (%s)", close_code)
@@ -306,6 +325,32 @@ class WebSocketClient:
             self._set_state(WebSocketState.WAITING)
 
             await asyncio.sleep(reconnect_wait)
+
+    async def _read_messages(self, websocket: aiohttp.ClientWebSocketResponse) -> None:
+        """Queue incoming frames until the connection closes or the caller stops us."""
+
+        async for msg in websocket:
+            if msg.type == aiohttp.WSMsgType.CLOSED:
+                log.info(
+                    "[EVENT READER]aiohttp WebSocket connection closed: Code: %s, Message: '%s'",
+                    msg.data,
+                    msg.extra,
+                )
+                continue
+
+            if msg.type == aiohttp.WSMsgType.ERROR:
+                log.info("[EVENT READER]aiohttp WebSocket error: '%s'", msg.data)
+                continue
+
+            if msg.type != aiohttp.WSMsgType.TEXT:
+                log.debug(
+                    "[EVENT READER]Got non-text WebSocket message: '%s'",
+                    msg.data,
+                )
+                continue
+
+            self._event_queue.put_nowait(msg.data)
+            self._event_history.append(msg.data)
 
     async def _event_processor(self) -> NoReturn:
         """Process incoming events."""
