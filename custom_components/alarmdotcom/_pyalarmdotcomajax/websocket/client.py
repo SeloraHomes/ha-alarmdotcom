@@ -42,6 +42,15 @@ ALL_TOKEN_T = Literal["*"]
 
 KEEP_ALIVE_SIGNAL_INTERVAL_S = 60
 MAX_RECONNECT_WAIT_S = 30 * 60
+
+# How many raw frames to keep for diagnostics. The old cap of 25 was useless on
+# any real account: a household with three phones reporting geofence crossings
+# (event type 555) produces a frame every few seconds, so the buffer covered
+# barely a minute - measured at 64 seconds on the account this was raised for.
+# The event being investigated had always aged out before anyone could download
+# diagnostics. At ~200 bytes per frame this holds roughly 100 KB and, at that
+# same chatty rate, something like twenty minutes of history.
+EVENT_HISTORY_MAXLEN = 500
 DEFAULT_SIGNALS_PER_SESSION_REFRESH = 1
 MAX_CONNECTION_ATTEMPTS = 25
 
@@ -107,7 +116,7 @@ class WebSocketClient:
         self._last_session_refresh: datetime | None = None
         self._session_refresh_interval_ms: int | None = None
         self._keep_alive_url: str | None = None
-        self._event_history: deque = deque(maxlen=25)
+        self._event_history: deque = deque(maxlen=EVENT_HISTORY_MAXLEN)
 
         self._initialized = False
 

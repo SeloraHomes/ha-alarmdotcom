@@ -148,7 +148,7 @@ def _connection_health(hub: AlarmHub) -> dict[str, Any]:
         if hub.api.active_system
         else None,
     }
-    # The WebSocket client already keeps the last 25 raw frames
+    # The WebSocket client already keeps the most recent raw frames
     # (websocket/client.py, `last_events`), but nothing surfaced them. Every
     # "my sensor stopped updating" report needs exactly this to tell a
     # transport-level miss from something dropping the message after receipt,
