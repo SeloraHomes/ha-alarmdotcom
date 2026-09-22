@@ -238,3 +238,49 @@ async def test_read_messages_queues_text_frames_only() -> None:
 
     assert client.last_events == ['{"EventType": 100}', '{"EventType": 15}']
     assert client._event_queue.qsize() == 2
+
+
+@pytest.mark.asyncio
+async def test_a_stalled_handshake_gives_up_instead_of_hanging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A handshake that hangs must fail fast and take the normal failure path.
+
+    Connections to webskt.alarm.com sometimes stall rather than refuse -
+    measured at 30.4s before raising on a live system, on planned replacements
+    as well as reconnects. Every second of that is lost events, so the wait is
+    ours to bound.
+    """
+    monkeypatch.setattr(ws_client, "WS_CONNECT_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(ws_client.random, "random", lambda: 0.0)
+
+    handshakes: list[float] = []
+
+    client = WebSocketClient(MagicMock())
+    client._authenticate = AsyncMock(return_value=None)
+
+    @contextlib.asynccontextmanager
+    async def stalling_ws_connect(_url: str, **_kwargs: object):
+        handshakes.append(time.monotonic())
+
+        if len(handshakes) > 1:
+            raise _StopReader
+
+        await asyncio.sleep(30)
+
+        yield MagicMock()  # never reached
+
+    client._bridge.ws_connect = stalling_ws_connect
+
+    emitted: list[WebSocketState] = []
+    client._emit_ws_state = lambda state, next_attempt_s=None: emitted.append(state)
+
+    started = time.monotonic()
+
+    with pytest.raises(_StopReader):
+        await client._event_reader()
+
+    # Gave up on the stall and moved on, rather than waiting it out.
+    assert time.monotonic() - started < 1
+    assert WebSocketState.DISCONNECTED in emitted
