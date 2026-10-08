@@ -1,17 +1,24 @@
+# Development and CI dependencies. The integration's own runtime requirements
+# live in custom_components/alarmdotcom/manifest.json; `just setup` and CI
+# install both.
 colorlog==6.10.1
-ruff >= 0.15.21
-# codespell>=2.4.1
-# yamllint>=1.37.0
-pre-commit>=4.6.0
-mypy>=2.3.0
-wheel>=0.47.0
-pathspec >= 1.1.1
-gitpython >= 3.1.51
 homeassistant >= 2026.7.2
-pytest >= 8.3.0
-pytest-asyncio >= 1.4.0
 # pytest-homeassistant-custom-component's version tracks Home Assistant core
 # closely - when bumping the homeassistant pin above, check this package's
 # releases for a matching version, or tests may break due to API drift
 # between the pinned core version and what this test helper expects.
 pytest-homeassistant-custom-component >= 0.13.346
+pytest >= 8.3.0
+pytest-asyncio >= 1.4.0
+
+# Linters and git hooks (see lefthook.yml)
+actionlint-py >= 1.7.7
+codespell >= 2.4.1
+lefthook >= 2.2.0
+mypy >= 2.3.0
+ruff >= 0.15.21
+taplo >= 0.9.3
+yamllint >= 1.37.0
+types-beautifulsoup4
+types-PyYAML
+types-requests

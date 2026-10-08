@@ -18,7 +18,6 @@ exclude = [
   "old",
   "references/",
   "scripts/*",
-  "scripts/upgrade_dependencies.py",
   "tests/",
 ]
 explicit_package_bases = true
@@ -78,7 +77,6 @@ warn_unused_ignores = true
   warn_return_any = false
 
 [tool.ruff]
-exclude           = ["scripts/upgrade_dependencies.py"]
 line-length       = 120
 respect-gitignore = true
 target-version    = "py313"
@@ -192,6 +190,8 @@ target-version    = "py313"
     # "**REDACTED**" placeholder string in diagnostics tests, not an actual
     # credential.
     "tests/*" = ["S101", "S105", "SLF001"]
+    # Release tooling shells out to git with fixed arguments.
+    "scripts/*" = ["S603", "S607"]
     # Vendored third-party library: builtin-shadowing names (e.g. `print`, `hex`)
     # match the upstream package's own API/naming. Restyling vendored code to fit
     # our own lint conventions just drifts it from upstream and makes future
