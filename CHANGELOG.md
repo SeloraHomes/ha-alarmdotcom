@@ -1,3 +1,7 @@
+# Changelog
+
+Release notes for new versions are published on the [GitHub releases page](https://github.com/SeloraHomes/ha-alarmdotcom/releases). They are generated from the commit history. This file keeps the history up to `2026.8.10.1b0`.
+
 ## 2026.8.10.1b0 (beta)
 
 ### Fixed
