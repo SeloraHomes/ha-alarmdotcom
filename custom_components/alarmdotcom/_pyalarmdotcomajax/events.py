@@ -37,7 +37,7 @@ class EventBrokerMessage:
     topic: EventBrokerTopic
 
 
-EventBrokerCallbackT = Callable[[EventBrokerMessage], None | Awaitable[None]]
+EventBrokerCallbackT = Callable[[EventBrokerMessage], Awaitable[None] | None]
 
 
 class EventBroker:

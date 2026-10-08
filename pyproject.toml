@@ -2,7 +2,7 @@
 count             = ""
 ignore-words-list = "hass,alot,datas,dof,dur,farenheit,hist,iff,ines,ist,lightsensor,mut,nd,pres,referer,ser,serie,te,technik,ue,uint,visability,wan,wanna,withing,windo"
 quiet-level       = 2
-skip              = "./.*,*.csv,*.json,*.html,*.aspx,tests/test_device_extensions.py,custom_components/alarmdotcom/_pyalarmdotcomajax/models/jsonapi/*"
+skip              = "./.*,*.csv,*.json,*.html,*.aspx,tests/test_device_extensions.py,*/_pyalarmdotcomajax/models/jsonapi/*"
 
 [tool.mypy]
 check_untyped_defs = true
@@ -123,6 +123,9 @@ target-version    = "py313"
     "PLR0912",
     "PLR0913",
     "PLR0915",
+    # Like PLR0913: constructors here mirror Alarm.com's API shape, and the
+    # vendored client keeps upstream's signatures.
+    "PLR0917",
     "PLR2004",
     "Q000",
     "Q001",
