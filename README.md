@@ -448,6 +448,30 @@ When reporting issues include:
 * Integration version
 * Relevant Home Assistant logs
 
+## Development
+
+You need Python 3.14, [uv](https://docs.astral.sh/uv/), and [just](https://just.systems/).
+
+```bash
+just setup    # create .venv with every dependency and install the git hooks
+just test     # run the test suite
+just check    # run every lint job (ruff, mypy, codespell, yamllint, taplo, actionlint) on all files
+```
+
+The git hooks are managed by [lefthook](https://lefthook.dev/) (`lefthook.yml`). They lint the files you commit and check that the commit message follows [Conventional Commits](https://www.conventionalcommits.org/) (`feat: ...`, `fix(camera): ...`).
+
+Changes go through pull requests to `main`. CI must pass before a PR can be merged. PRs are squash-merged, so **the PR title becomes the commit message** and must be a Conventional Commit too.
+
+## Releases
+
+Releases are automatic. When CI passes on `main` and there are `feat`, `fix`, `perf` or breaking (`!`) commits since the last release, the Release workflow:
+
+1. picks the next CalVer version, `YYYY.M.D.N` (N counts the releases cut that day),
+2. builds `alarmdotcom.zip` with that version stamped into `manifest.json`, which is what HACS installs,
+3. publishes a GitHub release with notes generated from those commits.
+
+To publish a pre-release (`YYYY.M.D.Nb0`) for testers, run the **Release** workflow manually from the Actions tab. `just release-preview` shows what the next release would contain.
+
 ---
 
 # License
