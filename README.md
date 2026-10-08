@@ -1,31 +1,34 @@
-# Maintained Fork
+# Alarm.com for Home Assistant
 
-This repository is an actively maintained fork of the original **Alarm.com for Home Assistant** integration.
+This repository is the actively maintained home of the **Alarm.com for Home Assistant** custom integration, maintained by [Selora Homes](https://github.com/SeloraHomes).
 
-The goal of this fork is to maintain compatibility with modern Home Assistant releases while continuing development of the Alarm.com integration as the Home Assistant platform evolves.
-
-Recent Home Assistant updates introduced architectural changes that affect older integrations. This fork adapts the integration to those changes and ensures continued functionality, including compliance with the Home Assistant device registry enforcement requirements introduced in Home Assistant 2025.12.
+Its goal is to keep the integration compatible with modern Home Assistant releases and to keep developing it as the platform evolves, including compliance with the device registry enforcement requirements introduced in Home Assistant 2025.12.
 
 Repository and issue tracker:
 
-https://github.com/ibasebcast/ha-alarmdotcom
-
-The maintainer of this fork operates Alarm.com systems professionally and has access to multiple Alarm.com environments, allowing testing across a wider variety of devices and system configurations.
+https://github.com/SeloraHomes/ha-alarmdotcom
 
 Community feedback, testing, and contributions are welcome.
 
 ---
 
+# Project History
+
+This project has changed hands a few times:
+
+1. [pyalarmdotcom/alarmdotcom](https://github.com/pyalarmdotcom/alarmdotcom) - the original integration, no longer maintained.
+2. [ibasebcast/ha-alarmdotcom](https://github.com/ibasebcast/ha-alarmdotcom) - a fork that modernized the integration (vendored API client, camera support, activity feed, auto-off timers, and more). It is no longer active.
+3. **SeloraHomes/ha-alarmdotcom** (this repository) - where development continues. Thanks to the previous maintainers for their work.
+
+If you installed the integration from one of the earlier repositories through HACS, remove that custom repository and add this one instead (see [Installation](#installation)). Your existing configuration entries are kept.
+
+---
+
 # Maintainer
 
-This integration is currently maintained by:
+This integration is maintained by **[Selora Homes](https://github.com/SeloraHomes)**.
 
-**Chris Pulliam**
-GitHub: https://github.com/ibasebcast
-
-The goal of this project is to ensure the Alarm.com ecosystem remains usable within Home Assistant as the platform evolves.
-
-This fork exists to provide:
+The project aims to provide:
 
 * Continued compatibility with new Home Assistant versions
 * Expanded device support
@@ -98,7 +101,7 @@ Where possible, use **locally controlled Home Assistant integrations** for autom
 Alarm.com may use different internal identifiers for some sensors.
 If a supported sensor does not appear in Home Assistant, please open an issue.
 
-https://github.com/ibasebcast/ha-alarmdotcom/issues
+https://github.com/SeloraHomes/ha-alarmdotcom/issues
 
 ---
 
@@ -113,7 +116,7 @@ https://github.com/ibasebcast/ha-alarmdotcom/issues
 5. Add the repository:
 
 ```
-https://github.com/ibasebcast/ha-alarmdotcom
+https://github.com/SeloraHomes/ha-alarmdotcom
 ```
 
 6. Select **Integration** as the category
@@ -425,7 +428,7 @@ Issues and pull requests are welcome.
 
 Please report bugs or feature requests here:
 
-https://github.com/ibasebcast/ha-alarmdotcom/issues
+https://github.com/SeloraHomes/ha-alarmdotcom/issues
 
 When reporting issues include:
 

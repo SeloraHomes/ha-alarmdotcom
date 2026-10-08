@@ -6,10 +6,10 @@
   ],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/ibasebcast/ha-alarmdotcom",
+  "documentation": "https://github.com/SeloraHomes/ha-alarmdotcom",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/ibasebcast/ha-alarmdotcom/issues",
+  "issue_tracker": "https://github.com/SeloraHomes/ha-alarmdotcom/issues",
   "requirements": [
     "beautifulsoup4>=4.10.0",
     "mashumaro~=3.16",
