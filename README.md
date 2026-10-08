@@ -16,9 +16,11 @@ Community feedback, testing, and contributions are welcome.
 
 This project has changed hands a few times:
 
-1. [pyalarmdotcom/alarmdotcom](https://github.com/pyalarmdotcom/alarmdotcom) - the original integration, no longer maintained.
-2. [ibasebcast/ha-alarmdotcom](https://github.com/ibasebcast/ha-alarmdotcom) - a fork that modernized the integration (vendored API client, camera support, activity feed, auto-off timers, and more). It is no longer active.
-3. **SeloraHomes/ha-alarmdotcom** (this repository) - where development continues. Thanks to the previous maintainers for their work.
+1. [pyalarmdotcom/alarmdotcom](https://github.com/pyalarmdotcom/alarmdotcom) and its API client [pyalarmdotcom/pyalarmdotcomajax](https://github.com/pyalarmdotcom/pyalarmdotcomajax) - the original integration and library, created by Justin Wong and developed for years by [Elahd Bar-Shai](https://github.com/elahd) and the pyalarmdotcom contributors. No longer maintained.
+2. [ibasebcast/ha-alarmdotcom](https://github.com/ibasebcast/ha-alarmdotcom) - a fork by [Chris Pulliam](https://github.com/ibasebcast) that kept the integration working on recent Home Assistant releases and added a vendored API client, camera support, lock unlock attribution, the activity feed, auto-off timers, and more. No longer active.
+3. **SeloraHomes/ha-alarmdotcom** (this repository) - where development continues.
+
+Many thanks to everyone who built and maintained this integration before us. See [License](#license) for how their work is credited.
 
 If you installed the integration from one of the earlier repositories through HACS, remove that custom repository and add this one instead (see [Installation](#installation)). Your existing configuration entries are kept.
 
@@ -83,6 +85,7 @@ Where possible, use **locally controlled Home Assistant integrations** for autom
 | Lock         | Lock, Unlock                          | ✔      | ✔           | ✔           | Tracks who unlocked via keypad code - see below                          |
 | Sensor       | None                                  | ✔      | ✔           | ✔           | Contact sensors will not report repeated changes within a 3 minute window |
 | Thermostat   | Heat, Cool, Auto, Fan                 | ✔      | ✔           | ✔           | Fan-only mode runs for the maximum duration supported by Alarm.com        |
+| Water Valve  | Open, Close                           | ✔      | ✔           | ✔           |                                                                           |
 | Camera       | Live WebRTC stream, Snapshot          | ✔      | —           | —           | Requires the `www/alarm-webrtc-card.js` Lovelace card                    |
 
 ---
@@ -91,10 +94,12 @@ Where possible, use **locally controlled Home Assistant integrations** for autom
 
 | Sensor Type             | Description                    |
 | ----------------------- | ------------------------------ |
+| Carbon Monoxide         | CO detectors                   |
 | Contact                 | Doors and windows              |
 | Freeze                  | Temperature threshold sensors  |
 | Glass Break / Vibration | Standalone or panel-integrated |
 | Motion                  | Motion detection sensors       |
+| Smoke                   | Smoke detectors                |
 | Vibration Contact       | Doors, safes, windows          |
 | Water                   | Leak sensors                   |
 
@@ -143,11 +148,12 @@ Removing the integration also removes its entities and the devices they were att
 
 When adding the integration you will be prompted for:
 
-| Parameter         | Required | Description                                             |
-| ----------------- | -------- | ------------------------------------------------------- |
-| Username          | Yes      | Alarm.com account username                              |
-| Password          | Yes      | Alarm.com account password                              |
-| One-Time Password | Optional | Required if your account uses two-factor authentication |
+| Parameter | Required | Description                |
+| --------- | -------- | -------------------------- |
+| Username  | Yes      | Alarm.com account username |
+| Password  | Yes      | Alarm.com account password |
+
+If your account uses two-factor authentication, you are then asked to pick how to receive the one-time password (e.g. SMS or email) and to enter it. The device is then trusted, so you are not asked again on every login.
 
 ---
 
@@ -155,14 +161,13 @@ When adding the integration you will be prompted for:
 
 These settings can be modified later using the **Configure** button on the Alarm.com integration card.
 
-| Parameter                | Description                                                 |
-| ------------------------- | ----------------------------------------------------------- |
-| Code                      | Code required for disarming or unlocking via Home Assistant |
-| Force Bypass              | Bypass open zones when arming                               |
-| No Entry Delay            | Skip entry delay sensors                                    |
-| Silent Arming             | Suppress panel beeps when arming                             |
-| Activity Poll Interval    | See [Polling Intervals](#polling-intervals) below            |
-| Full State Poll Interval  | See [Polling Intervals](#polling-intervals) below            |
+| Parameter                     | Description                                                                                     |
+| ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| Security Code                 | Code required to arm/disarm the alarm and unlock locks from Home Assistant                      |
+| Arm Home / Away / Night       | Per arming mode, any of: **Force Bypass** (bypass open zones), **No Entry Delay**, **Arm Silently** |
+| Activity Poll Interval        | See [Polling Intervals](#polling-intervals) below                                               |
+| Full State Poll Interval      | See [Polling Intervals](#polling-intervals) below                                               |
+| Camera Token Refresh Interval | See [Polling Intervals](#polling-intervals) below                                               |
 
 Some Alarm.com providers may restrict combinations of these options.
 
@@ -180,8 +185,6 @@ This integration exposes the following services, callable from **Developer Tools
 | `alarmdotcom.cancel_auto_off`  | Cancel a pending auto-off timer                                  | Same as above                 |
 
 `bypass_sensor`/`unbypass_sensor` take a `resource_id`, not an `entity_id` - find this in the sensor entity's own `resource_id` attribute (Settings → Devices & Services → Alarm.com → the sensor entity → Attributes). `set_auto_off`/`cancel_auto_off` use Home Assistant's standard entity target selector instead, since they operate on lights specifically and Home Assistant already has a rich picker for that.
-
----
 
 ---
 
@@ -206,7 +209,7 @@ entity: camera.your_camera_name
 
 ## How it works
 
-When the card loads it calls the `camera.turn_on` service which fetches a fresh set of WebRTC tokens from Alarm.com. Tokens are refreshed automatically every 30 minutes in the background so the stream is always ready. If a token expires before the next scheduled refresh the card requests new tokens automatically.
+When the card loads it calls the `camera.turn_on` service which fetches a fresh set of WebRTC tokens from Alarm.com. Tokens are refreshed automatically in the background (every 30 minutes by default, configurable via **Configure**) so the stream is always ready. If a token expires before the next scheduled refresh the card requests new tokens automatically.
 
 Still image snapshots are also available, which means the camera will display a thumbnail in the Home Assistant media browser and picture-glance dashboard cards.
 
@@ -306,7 +309,9 @@ This uses the same underlying poll as lock unlock attribution - nothing extra to
 * A camera detected motion/a person
 * A garage door opened or closed
 
-Garage door events specifically are cross-referenced against this account's known garage door devices (the same ones the garage door cover entity is built from) before being included - this is what lets them in while ordinary window/door sensors, which share the exact same event data shape, stay excluded as noise.
+Garage door events specifically are cross-referenced against this account's known garage door devices (the same ones the garage door cover entity is built from) before being included - this is what lets them in while ordinary window/door sensors, which share the exact same event data shape, stay out of the "Recent Activity" list.
+
+Window/door contact sensor open/close events are still fired on the event bus (they just don't appear in the "Recent Activity" list). This gives automations a second source for those events when a live websocket update is missed.
 
 **Example: catch any curated event in an automation**
 
@@ -328,12 +333,13 @@ Filter by `trigger.event.data.event_type_name` (e.g. `ArmedStay`, `DoorUnlocked`
 
 # Polling Intervals
 
-Two things are polled on a timer rather than arriving live over the websocket, and both are configurable via the **Configure** button on the Alarm.com integration card:
+A few things run on a timer rather than arriving live over the websocket. All are configurable via the **Configure** button on the Alarm.com integration card:
 
 | Setting                       | Default    | What it affects                                                              |
 | ------------------------------ | ---------- | ------------------------------------------------------------------------------ |
 | Activity poll interval         | 15 seconds | How quickly lock unlock attribution and the activity feed reflect real events |
 | Full state poll interval       | 5 minutes  | A safety net that re-syncs everything in case a websocket event was ever missed |
+| Camera token refresh interval  | 30 minutes | How often each camera's WebRTC tokens are renewed; lower it if streams stop working before the next refresh |
 
 The activity poll interval in particular is worth understanding before turning it down further: it hits an entirely undocumented Alarm.com endpoint with no confirmed rate-limit information. The default of 15 seconds is a deliberate tradeoff for a prompt welcome-home automation experience, not a guarantee it's safe at any value - if you ever run into problems, this is the first thing worth dialing back up.
 
@@ -341,7 +347,11 @@ The activity poll interval in particular is worth understanding before turning i
 
 # Development Status
 
-This integration is under active maintenance. **Version `2026.7.14.6`** is the current beta release. See `CHANGELOG.md` for the complete, detailed history - the highlights since the last stable release (`2026.7.9.3`):
+This integration is under active maintenance. The current version is the `version` field in [`manifest.json`](custom_components/alarmdotcom/manifest.json); see [`CHANGELOG.md`](CHANGELOG.md) for the complete, detailed history.
+
+<details>
+<summary>Highlights from the <code>2026.7.14.x</code> beta cycle (click to expand)</summary>
+
 
 ### New features
 
@@ -358,7 +368,9 @@ This integration is under active maintenance. **Version `2026.7.14.6`** is the c
 
 * `AlarmBridge.get_activity_history()` - the first data source in this integration with no persistent state and no live websocket delivery; it has to be actively polled rather than subscribed to, which is a genuinely different architecture from every device platform this integration otherwise models. The poller (`ActivityFeedTracker`, originally `LockActivityTracker` before it grew beyond just locks) now also drives the general activity feed and reads its own interval from the options flow.
 * **Garage door disambiguation for the activity feed** - garage door open/close now appears in the curated activity feed, cross-referenced against known garage door devices so ordinary window/door sensors (which share identical event data with a garage door) stay correctly excluded.
-* Continued expansion of the automated test suite alongside every change above - 106 tests as of this release, `mypy`/`ruff` both clean.
+* Continued expansion of the automated test suite alongside every change above.
+
+</details>
 
 <details>
 <summary>Highlights from the <code>2026.7.9.3</code> stable release (click to expand)</summary>
@@ -394,7 +406,7 @@ This integration is under active maintenance. **Version `2026.7.14.6`** is the c
 
 As of `2026.7.6.1b0`, the `pyalarmdotcomajax` Alarm.com API client lives directly in this repository, instead of being installed separately via a `git+` URL in `manifest.json`. As of `2026.7.7.1b0`, it's vendored under the deliberately collision-proof name `_pyalarmdotcomajax` at `custom_components/alarmdotcom/_pyalarmdotcomajax/` (see below for why the name changed).
 
-**Why:** `pyalarmdotcomajax` was previously a separate repository ([ibasebcast/pyalarmdotcomajax](https://github.com/ibasebcast/pyalarmdotcomajax)) that this integration depended on via a `git+` dependency. In practice, the two repos were never really independent — nearly every bug fix required a version bump in `pyalarmdotcomajax`, then a matching dependency-pin bump here, then a release of both. Bugs also frequently got reported in both repos as duplicates, since from a user's perspective it's one integration. On top of the coordination overhead, a `git+` dependency in `manifest.json` is a HACS/hassfest compliance issue, since HACS/hassfest strongly prefer plain PyPI-resolvable requirements.
+**Why:** `pyalarmdotcomajax` was previously a separate repository (originally [pyalarmdotcom/pyalarmdotcomajax](https://github.com/pyalarmdotcom/pyalarmdotcomajax), then the [ibasebcast/pyalarmdotcomajax](https://github.com/ibasebcast/pyalarmdotcomajax) fork) that this integration depended on via a `git+` dependency. In practice, the two repos were never really independent — nearly every bug fix required a version bump in `pyalarmdotcomajax`, then a matching dependency-pin bump here, then a release of both. Bugs also frequently got reported in both repos as duplicates, since from a user's perspective it's one integration. On top of the coordination overhead, a `git+` dependency in `manifest.json` is a HACS/hassfest compliance issue, since HACS/hassfest strongly prefer plain PyPI-resolvable requirements.
 
 **What changed:**
 - The library's code (and its git history) now lives under `custom_components/alarmdotcom/_pyalarmdotcomajax/`. It's imported as `_pyalarmdotcomajax` (leading underscore), not `pyalarmdotcomajax`, deliberately: no legitimate PyPI package can use a leading underscore, so this name can never collide with a stray pip-installed `pyalarmdotcomajax` (e.g. one left over from before this vendoring change). Without that, a missing or broken vendored copy could silently fall back to a stale pip-installed copy instead of failing loudly - which is exactly what happened during beta testing of `2026.7.6.1b0`.
@@ -440,6 +452,6 @@ When reporting issues include:
 
 # License
 
-This project is licensed under the MIT License.
+Contributions made since the [ibasebcast](https://github.com/ibasebcast/ha-alarmdotcom) fork are licensed under the **Apache License 2.0** - see [`LICENSE`](LICENSE).
 
-See the **LICENSE** file for details.
+This project is derived from [pyalarmdotcom/alarmdotcom](https://github.com/pyalarmdotcom/alarmdotcom) and [pyalarmdotcom/pyalarmdotcomajax](https://github.com/pyalarmdotcom/pyalarmdotcomajax), which are licensed under the **MIT License**, Copyright (c) 2020 Justin Wong. The original code keeps that license; its notice is reproduced in [`LICENSE-MIT`](LICENSE-MIT), as the MIT License requires.
