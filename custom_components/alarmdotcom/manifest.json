@@ -12,9 +12,11 @@
   "issue_tracker": "https://github.com/SeloraHomes/ha-alarmdotcom/issues",
   "requirements": [
     "beautifulsoup4>=4.10.0",
+    "click>=8.0.0",
     "mashumaro~=3.16",
     "phonenumbers>=9.0.4",
     "pyhumps~=3.8.0",
+    "rich>=13.8.0",
     "typer>=0.15.2"
   ],
   "version": "2026.9.8.1b0"
