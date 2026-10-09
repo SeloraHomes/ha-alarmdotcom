@@ -18,7 +18,7 @@ default:
 setup:
     uv venv --allow-existing -p 3.14 .venv
     uv pip install --python .venv/bin/python -r requirements-dev.txt \
-      $(python3 -c 'import json; print(" ".join(json.load(open("{{ component }}/manifest.json"))["requirements"]))')
+      $(python3 scripts/manifest_requirements.py)
     .venv/bin/lefthook install
 
 # ── Test ──────────────────────────────────────────────────────────────────────

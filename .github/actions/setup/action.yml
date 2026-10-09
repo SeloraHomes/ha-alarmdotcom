@@ -16,5 +16,5 @@ runs:
     - name: Install dependencies
       shell: bash
       run: |
-        mapfile -t requirements < <(python -c 'import json; print("\n".join(json.load(open("custom_components/alarmdotcom/manifest.json"))["requirements"]))')
+        mapfile -t requirements < <(python scripts/manifest_requirements.py)
         uv pip install -r requirements-dev.txt "${requirements[@]}"
