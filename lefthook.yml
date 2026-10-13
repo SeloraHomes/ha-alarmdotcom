@@ -1,0 +1,54 @@
+# Git hooks. `just setup` installs them; CI runs the same pre-commit jobs on
+# every file with `lefthook run pre-commit --all-files`, so a green commit
+# locally means a green lint job.
+#
+# Tools come from the project's .venv when it exists, otherwise from PATH.
+x-venv: &venv
+  PATH: .venv/bin:$PATH
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: ruff
+      glob: "*.py"
+      run: ruff check --fix {staged_files}
+      stage_fixed: true
+      env: *venv
+
+    - name: mypy
+      glob: "custom_components/**/*.py"
+      run: mypy custom_components/
+      env: *venv
+
+    - name: codespell
+      run: codespell --toml pyproject.toml {staged_files}
+      env: *venv
+
+    - name: yamllint
+      glob: "*.{yaml,yml}"
+      run: yamllint --strict {staged_files}
+      env: *venv
+
+    - name: taplo
+      glob: "*.toml"
+      run: taplo fmt {staged_files} && taplo lint --no-schema {staged_files}
+      stage_fixed: true
+      env: *venv
+
+    - name: actionlint
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: actionlint {staged_files}
+      env: *venv
+
+    - name: json
+      glob: "*.json"
+      run: for f in {staged_files}; do python3 -m json.tool "$f" > /dev/null || exit 1; done
+
+    - name: whitespace
+      # Trailing whitespace and leftover conflict markers.
+      run: git diff --cached --check
+
+commit-msg:
+  jobs:
+    - name: conventional-commit
+      run: python3 scripts/check_commit_msg.py {1}

@@ -1,0 +1,20 @@
+name: Set up the project
+description: Create .venv with the dev requirements and the integration's runtime requirements.
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v10.2.0
+      with:
+        python-version: "3.14"
+        activate-environment: true
+        enable-cache: true
+        cache-dependency-glob: |
+          requirements-dev.txt
+          custom_components/alarmdotcom/manifest.json
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        mapfile -t requirements < <(python scripts/manifest_requirements.py)
+        uv pip install -r requirements-dev.txt "${requirements[@]}"

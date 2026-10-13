@@ -1,17 +1,24 @@
+# Development and CI dependencies, pinned so CI is reproducible; Dependabot
+# proposes bumps as PRs, which CI then checks. The integration's own runtime
+# requirements live in custom_components/alarmdotcom/manifest.json;
+# `just setup` and CI install both.
 colorlog==6.10.1
-ruff >= 0.15.21
-# codespell>=2.4.1
-# yamllint>=1.37.0
-pre-commit>=4.6.0
-mypy>=2.3.0
-wheel>=0.47.0
-pathspec >= 1.1.1
-gitpython >= 3.1.51
-homeassistant >= 2026.7.2
-pytest >= 8.3.0
-pytest-asyncio >= 1.4.0
+homeassistant==2026.9.4
 # pytest-homeassistant-custom-component's version tracks Home Assistant core
-# closely - when bumping the homeassistant pin above, check this package's
-# releases for a matching version, or tests may break due to API drift
-# between the pinned core version and what this test helper expects.
-pytest-homeassistant-custom-component >= 0.13.346
+# closely - bump it together with the homeassistant pin above, or tests may
+# break due to API drift between core and this test helper.
+pytest-homeassistant-custom-component==0.13.367
+pytest==9.0.3
+pytest-asyncio==1.4.0
+
+# Linters and git hooks (see lefthook.yml)
+actionlint-py==1.7.12.25
+codespell==2.4.3
+lefthook==2.2.0
+mypy==2.4.0
+ruff==0.16.10
+taplo==0.9.3
+yamllint==1.38.0
+types-beautifulsoup4==4.12.0.20250516
+types-PyYAML==6.0.12.20260906
+types-requests==2.33.0.20261006

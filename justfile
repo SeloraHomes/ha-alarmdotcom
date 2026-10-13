@@ -3,11 +3,23 @@
 
 set dotenv-load
 
+# Prefer the tools installed by `just setup`
+export PATH := justfile_directory() + "/.venv/bin:" + env_var("PATH")
+
 component := "custom_components/alarmdotcom"
 
 # List available recipes
 default:
     @just --list
+
+# ── Setup ─────────────────────────────────────────────────────────────────────
+
+# Create .venv with the dev and runtime dependencies, and install the git hooks
+setup:
+    uv venv --allow-existing -p 3.14 .venv
+    uv pip install --python .venv/bin/python -r requirements-dev.txt \
+      $(python3 scripts/manifest_requirements.py)
+    .venv/bin/lefthook install
 
 # ── Test ──────────────────────────────────────────────────────────────────────
 
@@ -17,10 +29,10 @@ test *args='':
 
 # ── Lint & Format ────────────────────────────────────────────────────────────
 
-# Run ruff + mypy (the fast subset; `just check` runs every pre-commit hook)
+# Run ruff + mypy (the fast subset; `just check` runs every lint job)
 lint: lint-ruff lint-mypy
 
-# Lint with ruff (same scope as the pre-commit hook: the whole tree)
+# Lint with ruff (the whole tree)
 lint-ruff:
     ruff check .
 
@@ -33,9 +45,15 @@ fmt:
     ruff format custom_components/ tests/
     ruff check --fix custom_components/ tests/
 
-# Run the full pre-commit suite
+# Run every lefthook pre-commit job on all files, as CI does
 check:
-    pre-commit run --all-files
+    lefthook run pre-commit --all-files
+
+# ── Release ─────────────────────────────────────────────────────────────────
+
+# Preview the version and notes the next release would get
+release-preview:
+    @python3 scripts/release.py plan --notes-file /dev/stdout
 
 # ── Deploy ──────────────────────────────────────────────────────────────────
 
