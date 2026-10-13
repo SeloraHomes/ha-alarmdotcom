@@ -1,21 +1,60 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
+  # Release main once CI has passed on it.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  # Cut a release by hand, e.g. a pre-release for testers.
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Publish a pre-release (YYYY.M.D.Nb0)
+        type: boolean
+        default: true
 
 permissions:
   contents: write
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
-  github-release:
+  release:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/checkout@v7
         with:
-          generate_release_notes: true
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Plan the release
+        id: plan
+        env:
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(--notes-file notes.md)
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          python3 scripts/release.py plan "${args[@]}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and publish
+        # A manual run always publishes; an automatic one only when there are
+        # feat, fix, perf or breaking commits since the last release.
+        if: github.event_name == 'workflow_dispatch' || steps.plan.outputs.releasable == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.plan.outputs.version }}
+          TARGET: ${{ github.event.workflow_run.head_sha || github.sha }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(--target "$TARGET" --title "$VERSION" --notes-file notes.md)
+          if [ "$PRERELEASE" = true ]; then args+=(--prerelease); fi
+          python3 scripts/release.py stamp "$VERSION"
+          (cd custom_components/alarmdotcom && zip -qr ../../alarmdotcom.zip . -x '*__pycache__*')
+          gh release create "$VERSION" alarmdotcom.zip www/alarm-webrtc-card.js "${args[@]}"

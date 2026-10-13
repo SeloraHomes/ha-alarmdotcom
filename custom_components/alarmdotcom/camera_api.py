@@ -629,10 +629,23 @@ class AlarmCameraSession:
             )
             return config
 
+        # Name the reason, not just the shape. The key names alone say nothing
+        # about *why* there is no config, and the one field that does -
+        # errorEnum - was invisible without turning on a separate logger that
+        # is pinned off by default because it prints live credentials. The
+        # janus fields are reported as set/empty rather than by value: the
+        # token is a credential, and all that matters here is whether
+        # Alarm.com filled them in.
         _LOGGER.warning(
-            "No WebRTC config found for camera %s. "
+            "No WebRTC config found for camera %s. errorEnum=%s, isMjpeg=%s, "
+            "janusGatewayUrl=%s, janusToken=%s, proxyUrl=%s. "
             "included types: %s. Top-level keys: %s",
             camera_id,
+            top_attrs.get("errorEnum"),
+            top_attrs.get("isMjpeg"),
+            "set" if top_attrs.get("janusGatewayUrl") else "empty",
+            "set" if top_attrs.get("janusToken") else "empty",
+            "set" if top_attrs.get("proxyUrl") else "empty",
             [inc.get("type") for inc in included],
             list(top_attrs.keys()),
         )
