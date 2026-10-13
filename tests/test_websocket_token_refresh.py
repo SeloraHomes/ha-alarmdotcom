@@ -131,7 +131,7 @@ async def test_a_slow_handshake_eats_into_the_deadline(
 
     Starting the deadline after the handshake instead would hand the
     connection a full fresh lifetime, so a slow connect would push the
-    replacement past the server's own expiry - the 1008 close this pre-empts.
+    replacement past the server's own expiry - the 1008 close this preempts.
     The tell is timing: with the budget spent on the handshake, the
     replacement follows immediately instead of a whole lifetime later.
     """

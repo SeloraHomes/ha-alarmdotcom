@@ -65,6 +65,15 @@ WS_TOKEN_LIFETIME_S = 4 * 60 + 30
 # no timeout of our own that is 30 seconds of lost events for a connection we
 # could have retried in two. A successful handshake there takes ~150ms.
 WS_CONNECT_TIMEOUT_S = 10
+
+# How many raw frames to keep for diagnostics. The old cap of 25 was useless on
+# any real account: a household with three phones reporting geofence crossings
+# (event type 555) produces a frame every few seconds, so the buffer covered
+# barely a minute - measured at 64 seconds on the account this was raised for.
+# The event being investigated had always aged out before anyone could download
+# diagnostics. At ~200 bytes per frame this holds roughly 100 KB and, at that
+# same chatty rate, something like twenty minutes of history.
+EVENT_HISTORY_MAXLEN = 500
 DEFAULT_SIGNALS_PER_SESSION_REFRESH = 1
 MAX_CONNECTION_ATTEMPTS = 25
 
@@ -130,7 +139,7 @@ class WebSocketClient:
         self._last_session_refresh: datetime | None = None
         self._session_refresh_interval_ms: int | None = None
         self._keep_alive_url: str | None = None
-        self._event_history: deque = deque(maxlen=25)
+        self._event_history: deque = deque(maxlen=EVENT_HISTORY_MAXLEN)
 
         self._initialized = False
 
@@ -298,7 +307,7 @@ class WebSocketClient:
                     with contextlib.suppress(AttributeError):
                         if websocket.close_code:
                             # 1008 here means the server rejected our token - the
-                            # expiry that WS_TOKEN_LIFETIME_S now pre-empts. Seeing
+                            # expiry that WS_TOKEN_LIFETIME_S now preempts. Seeing
                             # it again means the server's lifetime got shorter than
                             # ours, and that constant should come down.
                             close_code = aiohttp.WSCloseCode(int(websocket.close_code))
