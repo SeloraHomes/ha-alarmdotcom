@@ -466,11 +466,11 @@ Changes go through pull requests to `main`. CI must pass before a PR can be merg
 
 Releases are automatic. When CI passes on `main` and there are `feat`, `fix`, `perf` or breaking (`!`) commits since the last release, the Release workflow:
 
-1. picks the next CalVer version, `YYYY.M.D.N` (N counts the releases cut that day),
+1. picks the next version, `YYYY.M.N`, like Home Assistant: N counts the releases in the month from 0 (`2026.11.0`, `2026.11.1`). October 2026 continues at `2026.10.14`, after the earlier `2026.10.13.x` releases, so that updates keep sorting as newer,
 2. builds `alarmdotcom.zip` with that version stamped into `manifest.json`, which is what HACS installs,
 3. publishes a GitHub release with notes generated from those commits.
 
-To publish a pre-release (`YYYY.M.D.Nb0`) for testers, run the **Release** workflow manually from the Actions tab. `just release-preview` shows what the next release would contain.
+To publish a pre-release of the next version (`YYYY.M.N-bK`, e.g. `2026.11.2-b0`) for testers, run the **Release** workflow manually from the Actions tab. `just release-preview` shows what the next release would contain.
 
 ---
 

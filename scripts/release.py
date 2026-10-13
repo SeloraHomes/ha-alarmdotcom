@@ -2,10 +2,17 @@
 """
 Plan a CalVer release from the Conventional Commits since the last release.
 
-Versions are YYYY.M.D.N (N counts releases cut that day, starting at 1), with a
-"b0" suffix for pre-releases: 2026.10.8.1, 2026.10.8.2b0. This keeps sorting
-above every earlier tag, which is how Home Assistant and HACS decide that an
-update is available.
+Versions follow Home Assistant's own scheme, YYYY.M.N, where N counts the
+releases in the month from 0: 2026.11.0, 2026.11.1. A pre-release of the next
+version is YYYY.M.N-bK: 2026.11.2-b0, 2026.11.2-b1, then 2026.11.2.
+
+Home Assistant and HACS offer an update only when the new version sorts above
+the installed one (AwesomeVersion), so:
+- N continues from the highest one already used in the month. Releases up to
+  2026.10.13.2 used YYYY.M.D.N, so October 2026 continues at 2026.10.14.
+- The pre-release suffix needs the dash: AwesomeVersion ignores a "b0" that
+  directly follows a two-digit N, so 2026.11.12b0 would compare equal to
+  2026.11.12, while 2026.11.12-b0 sorts below it.
 
 Usage:
     release.py plan [--prerelease] [--notes-file PATH]
@@ -29,7 +36,8 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "custom_components" / "alarmdotcom" / "manifest.json"
 REPO_URL = "https://github.com/SeloraHomes/ha-alarmdotcom"
 
-TAG = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:\.(\d+))?(b\d+)?$")
+# YYYY.M.N[-bK], plus the earlier YYYY.M.D[.N][bK] tags.
+TAG = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d+)(?:\.(\d+))?(?:-?b(\d+))?$")
 COMMIT = re.compile(r"^(?P<type>\w+)(?:\((?P<scope>[^)]+)\))?(?P<breaking>!)?: (?P<description>.+)$")
 SECTIONS = {"feat": "Features", "fix": "Bug fixes", "perf": "Performance"}
 
@@ -50,13 +58,19 @@ def git(*args: str) -> str:
     return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
 
 
-def tag_key(tag: str) -> tuple[int, int, int, int, int]:
+def tag_key(tag: str) -> tuple[int, int, int, int, int, int]:
     """Sort key for a release tag; a pre-release sorts below its final release."""
     match = TAG.match(tag)
     if not match:
         raise ValueError(f"Not a release tag: {tag}")
-    year, month, day, serial, pre = match.groups()
-    return (int(year), int(month), int(day), int(serial or 0), 0 if pre else 1)
+    year, month, number, serial, pre = match.groups()
+    is_final = pre is None
+    return (int(year), int(month), int(number), int(serial or 0), int(is_final), int(pre or 0))
+
+
+def is_stable(tag: str) -> bool:
+    """Whether a release tag is a final release rather than a pre-release."""
+    return bool(tag_key(tag)[4])
 
 
 def release_tags() -> list[str]:
@@ -65,11 +79,15 @@ def release_tags() -> list[str]:
 
 
 def next_version(tags: list[str], today: dt.date, *, prerelease: bool) -> str:
-    """Return the next free version for today."""
-    base = f"{today.year}.{today.month}.{today.day}"
-    serials = [tag_key(tag)[3] for tag in tags if tag.startswith(f"{base}.")]
-    version = f"{base}.{max(serials, default=0) + 1}"
-    return f"{version}b0" if prerelease else version
+    """Return the next free version for this month."""
+    month = [tag_key(tag) for tag in tags if tag_key(tag)[:2] == (today.year, today.month)]
+    released = [key[2] for key in month if key[4]]
+    number = max(released) + 1 if released else 0
+    version = f"{today.year}.{today.month}.{number}"
+    if not prerelease:
+        return version
+    betas = [key[5] for key in month if key[2:5] == (number, 0, 0)]
+    return f"{version}-b{max(betas) + 1 if betas else 0}"
 
 
 def commits_since(ref: str | None) -> list[Commit]:
@@ -111,7 +129,7 @@ def plan(args: argparse.Namespace) -> None:
     tags = release_tags()
     # Stable releases are cut from everything since the last stable one, so a
     # stable release also lists what earlier pre-releases already shipped.
-    candidates = tags if args.prerelease else [tag for tag in tags if tag_key(tag)[4]]
+    candidates = tags if args.prerelease else [tag for tag in tags if is_stable(tag)]
     previous = candidates[-1] if candidates else None
     commits = commits_since(previous)
     version = next_version(tags, dt.datetime.now(dt.UTC).date(), prerelease=args.prerelease)
