@@ -61,12 +61,14 @@ async def cleanup_orphaned_entities_and_devices(
     # async_entries_for_config_entry rather than device_registry.devices, whose mapping
     # interface is deprecated and stops working in HA Core 2027.9. The helper already
     # narrows to devices this entry touches; the check below keeps only those it owns
-    # outright, which is the same set the previous full scan selected.
+    # outright, which is the same set the previous full scan selected. Ownership is read
+    # from config_entry_id: DeviceEntry.config_entries is deprecated and stops working in
+    # HA Core 2027.10, now that a device belongs to a single config entry.
     for device in list(
         async_entries_for_config_entry(device_registry, config_entry.entry_id)
     ):
         if (
-            device.config_entries == {config_entry.entry_id}
+            device.config_entry_id == config_entry.entry_id
             and device.entry_type != DeviceEntryType.SERVICE
         ):
             device_entities = [

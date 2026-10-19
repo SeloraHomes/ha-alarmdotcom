@@ -10,13 +10,18 @@ takes on every setup:
   entries, superseded by ``async_get_device_by_identifier``;
 * ``device_registry.devices`` used as a mapping — removed in HA Core 2027.9.
 
-The last one is not merely a warning on current betas: it raises. These tests
+A fourth arrived in HA Core 2026.10: ``DeviceEntry.config_entries``, deprecated now
+that a device belongs to a single config entry (``config_entry_id``) and removed in
+2027.10.
+
+``device_registry.devices`` is not merely a warning on current betas: it raises. These tests
 assert the shape of what we emit and the helpers we call, so a regression fails
 here rather than in a user's log.
 """
 
 from __future__ import annotations
 
+import inspect
 from unittest.mock import MagicMock
 
 import pytest
@@ -177,3 +182,35 @@ async def test_orphan_cleanup_reaches_the_same_devices_as_the_old_full_scan(
     assert registry.async_get(ours_live.id) is not None, "a device with a live entity stays"
     assert registry.async_get(theirs_orphan.id) is not None, "another entry's device is not ours"
     assert entity_registry.async_get(live.entity_id) is not None
+
+
+async def test_orphan_cleanup_reads_ownership_from_config_entry_id(
+    hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The orphan sweep must not touch the deprecated ``DeviceEntry.config_entries``.
+
+    HA Core 2026.10 deprecates it in favour of ``config_entry_id`` and removes it in
+    2027.10. The pinned test core predates the warning, so make the property raise
+    when this integration reads it, whichever core version runs the test. Reads from
+    core itself pass through: 2026.9's ``async_remove_device`` still uses it.
+    """
+    original = dr.DeviceEntry.config_entries
+
+    def _deprecated(device: dr.DeviceEntry) -> set[str]:
+        caller = inspect.stack(context=0)[1].filename.replace("\\", "/")
+        if "/custom_components/alarmdotcom/" in caller:
+            raise AssertionError("DeviceEntry.config_entries is deprecated; read config_entry_id")
+        return original.fget(device)
+
+    monkeypatch.setattr(dr.DeviceEntry, "config_entries", property(_deprecated))
+
+    entry = MockConfigEntry(domain=DOMAIN, data={}, title="Alarm.com")
+    entry.add_to_hass(hass)
+
+    registry = dr.async_get(hass)
+    orphan = _register(hass, entry.entry_id, "ours-orphan")
+
+    await cleanup_orphaned_entities_and_devices(hass, entry, set(), set(), "sensor")
+
+    assert registry.async_get(orphan.id) is None, "our own orphan should still be swept"
