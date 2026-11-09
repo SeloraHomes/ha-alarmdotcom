@@ -2,14 +2,16 @@
 # proposes bumps as PRs, which CI then checks. The integration's own runtime
 # requirements live in custom_components/alarmdotcom/manifest.json;
 # `just setup` and CI install both.
-colorlog==6.10.1
-homeassistant==2026.9.4
+colorlog==6.12.0
+homeassistant==2026.10.4
 # pytest-homeassistant-custom-component's version tracks Home Assistant core
 # closely - bump it together with the homeassistant pin above, or tests may
 # break due to API drift between core and this test helper.
-pytest-homeassistant-custom-component==0.13.367
+pytest-homeassistant-custom-component==0.13.375
 pytest==9.0.3
 pytest-asyncio==1.4.0
+# homeassistant.components.camera imports it at module level (camera tests).
+PyTurboJPEG==2.6.1
 
 # Linters and git hooks (see lefthook.yml)
 actionlint-py==1.7.12.25

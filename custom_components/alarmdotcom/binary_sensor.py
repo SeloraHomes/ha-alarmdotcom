@@ -22,7 +22,8 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import DiscoveryInfoType
 
 from .binary_sensor_words import LANG_DOOR, LANG_WINDOW
-from .const import DATA_HUB, DOMAIN
+from .camera_detection import CameraDetectionSensor
+from .const import DOMAIN
 from .entity import (
     AdcControllerT,
     AdcEntity,
@@ -56,7 +57,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up the binary sensor platform."""
 
-    hub: AlarmHub = hass.data[DOMAIN][config_entry.entry_id][DATA_HUB]
+    hub: AlarmHub = config_entry.runtime_data.hub
 
     entities: list[BinarySensorEntity] = []
     for entity_description in ENTITY_DESCRIPTIONS:
@@ -82,6 +83,18 @@ async def async_setup_entry(
             for device in hub.api.managed_devices.values()
         )
 
+    camera_ids = {camera.id for camera in hub.api.cameras}
+    if (session := config_entry.runtime_data.camera_session) is not None:
+        try:
+            camera_ids.update(str(camera["id"]) for camera in await session.get_camera_list())
+        except Exception:
+            # Video account permissions must never prevent security sensors loading.
+            log.debug("Camera analytics discovery unavailable; security sensors continue.")
+    entities.extend(
+        CameraDetectionSensor(hub, resource_id, classification)
+        for resource_id in sorted(camera_ids)
+        for classification in ("person", "vehicle", "animal", "package")
+    )
     async_add_entities(entities)
 
     current_entity_ids = {entity.entity_id for entity in entities}
@@ -139,6 +152,14 @@ def is_on_fn(hub: AlarmHub, sensor_id: str) -> bool:
     resource = hub.api.sensors.get(sensor_id) or hub.api.water_sensors.get(sensor_id)
 
     if resource is None or resource.attributes.state == pyadc.sensor.SensorState.UNKNOWN:
+        return False
+
+    # Glass-break detectors may retain a stale activated state after restoration.
+    # The explicit normal status reported by the panel takes precedence.
+    if resource.attributes.device_type in (
+        pyadc.sensor.SensorSubtype.GLASS_BREAK_DETECTOR,
+        pyadc.sensor.SensorSubtype.PANEL_GLASS_BREAK_DETECTOR,
+    ) and resource.attributes.open_closed_status == 3:
         return False
 
     return (resource.attributes.state.value % 2) == 0

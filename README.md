@@ -41,36 +41,154 @@ The project aims to provide:
 
 # Overview
 
-This custom component allows Home Assistant to interface with **Alarm.com** using the Alarm.com web platform.
+This custom integration allows Home Assistant to interface with [**Alarm.com**](https://Alarm.com) using the Alarm.com web platform.
 
 The integration focuses primarily on Alarm.com security system functionality and requires an Alarm.com service package that includes security system support.
 
 Because this integration communicates with Alarm.com cloud services, functionality may change if Alarm.com modifies their platform.
 
 ---
+> [!WARNING]
+> # Safety Notice
+>
+>This integration is designed for **convenience and automation**, but it should **not be relied upon for safety-critical functions.**
+>
+>Reasons include:
+>
+>1. This integration communicates with Alarm.com using unofficial endpoints.
+>2. Alarm.com status updates may take time to propagate.
+>3. Home Assistant automations may introduce unintended behavior.
+>4. This code is community developed and may contain bugs.
+>
+>For critical alerts such as:
+>
+>* Break-ins
+>* Fire
+>* Carbon monoxide
+>* Water leaks
+>* Freeze warnings
+>
+>You should rely on **Alarm.com's official monitoring services and mobile applications.**
+>
+>Where possible, use **locally controlled Home Assistant integrations** for automation. Local integrations continue functioning during internet outages, while this integration requires cloud communication.
 
-# Safety Notice
+> [!TIP]
+> Some alarm.com devices use Z-Wave, so if you have a Z-Wave dongle then you can move the devices from alarm.com to Home Assistant's [native Z-Wave integration](https://www.home-assistant.io/integrations/zwave_js/)
+---
 
-This integration is designed for **convenience and automation**, but it should **not be relied upon for safety-critical functions.**
+# Installation and Setup
 
-Reasons include:
+## Installation
 
-1. This integration communicates with Alarm.com using unofficial endpoints.
-2. Alarm.com status updates may take time to propagate.
-3. Home Assistant automations may introduce unintended behavior.
-4. This code is community developed and may contain bugs.
+Releases are published on the [GitHub releases page](https://github.com/SeloraHomes/ha-alarmdotcom/releases).
 
-For critical alerts such as:
+Back up Home Assistant before updating through HACS, then restart Home Assistant.
 
-* Break-ins
-* Fire
-* Carbon monoxide
-* Water leaks
-* Freeze warnings
+### Install Using HACS (Recommended)
 
-You should rely on **Alarm.com's official monitoring services and mobile applications.**
+[![Open your Home Assistant instance and open this repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=SeloraHomes&repository=ha-alarmdotcom&category=integration)
 
-Where possible, use **locally controlled Home Assistant integrations** for automation. Local integrations continue functioning during internet outages, while this integration requires cloud communication.
+The button above opens this repository in HACS on your Home Assistant instance (it uses [My Home Assistant](https://my.home-assistant.io/)). If you have not linked an instance, use the manual steps below.
+
+1. Open **HACS**
+2. Navigate to **Integrations**
+3. Click the **three-dot menu**
+4. Select **Custom repositories**
+5. Add the repository:
+
+```
+https://github.com/SeloraHomes/ha-alarmdotcom
+```
+
+6. Select **Integration** as the category
+7. Click **Add**
+8. Install **Alarm.com**
+9. Restart Home Assistant
+
+After restarting:
+
+**Settings → Devices & Services → Add Integration → Alarm.com**
+
+[![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=alarmdotcom)
+
+## Prerequisites
+Before setting up this integration you need the following
+
+1. An active alarm.com account
+2. Know the login for the alarm.com and be able to fill the One-Time Password
+3. Have a device connected to alarm.com
+
+### Permissions for a dedicated Alarm.com login
+
+Sign into the Alarm.com website using the **exact credentials configured in Home Assistant**. Confirm that this login can see and control the devices you want to use. Your main login's permissions do not automatically apply to a separate HA login.
+
+In Alarm.com's login management, grant access to the required device categories. In particular, enable **Lights/Thermostats** if you expect those devices in HA. Enable the **Activity** read permission for activity-history features. Reload the integration after changing permissions.
+
+Missing permissions can produce empty device lists or HTTP 423 responses while other device categories continue working. In #115, enabling Lights/Thermostats for the dedicated HA login immediately restored all four lights. Check permissions before reinstalling, capturing network traffic, or trying another build.
+
+## Setup
+
+When adding the integration you will be prompted for:
+
+| Parameter         | Required | Description                                             |
+| ----------------- | -------- | ------------------------------------------------------- |
+| Username          | Yes      | Alarm.com account username                              |
+| Password          | Yes      | Alarm.com account password                              |
+| One-Time Password | Maybe    | Required if your account uses two-factor authentication |
+
+---
+
+# Integration Options
+
+These settings can be modified later using the **Configure** button on the Alarm.com integration card.
+
+| Parameter      | Description                                                 |
+| -------------- | ----------------------------------------------------------- |
+| Code           | Code required for disarming or unlocking via Home Assistant |
+| Force Bypass   | Bypass open zones when arming                               |
+| No Entry Delay | Skip entry delay sensors                                    |
+| Silent Arming  | Suppress panel beeps when arming                            |
+
+Some Alarm.com providers may restrict combinations of these options.
+
+---
+
+# Services
+
+This integration exposes the following services, callable from **Developer Tools → Actions**, automations, or scripts.
+
+| Service                       | Purpose                                                          | Target                        |
+| ------------------------------ | ----------------------------------------------------------------- | ------------------------------ |
+| `alarmdotcom.bypass_sensor`    | Bypass a supported sensor (e.g. a door left open) for the current arm period | `resource_id` field (see the sensor entity's `resource_id` attribute), optional `partition_id` |
+| `alarmdotcom.unbypass_sensor`  | Remove a bypass from a sensor                                    | Same as above                 |
+| `alarmdotcom.set_auto_off`     | Schedule one or more lights to turn off after a duration - see [Auto-Off Timers](#auto-off-timers) below | Standard entity target picker, restricted to this integration's lights |
+| `alarmdotcom.cancel_auto_off`  | Cancel a pending auto-off timer                                  | Same as above                 |
+
+`bypass_sensor`/`unbypass_sensor` take a `resource_id`, not an `entity_id` - find this in the sensor entity's own `resource_id` attribute (Settings → Devices & Services → Alarm.com → the sensor entity → Attributes). `set_auto_off`/`cancel_auto_off` use Home Assistant's standard entity target selector instead, since they operate on lights specifically and Home Assistant already has a rich picker for that.
+
+### Set a temporary access schedule
+
+The admin-only `alarmdotcom.set_temporary_access` action updates the temporary
+schedule for an existing Alarm.com user. Select the integration account and
+enter the system ID, the user ID from the portal's user page, and the start
+and end times in ISO 8601 with `Z` or an explicit UTC offset.
+
+### Read a temporary user's saved schedule
+
+The response-only `alarmdotcom.get_temporary_user_schedule` action accepts the same account, system ID, and user ID as the write action. In a script:
+
+```yaml
+- action: alarmdotcom.get_temporary_user_schedule
+  data:
+    config_entry_id: YOUR_CONFIG_ENTRY_ID
+    system_id: "YOUR_SYSTEM_ID"
+    user_id: "YOUR_USER_ID"
+  response_variable: saved_access
+```
+
+Response fields are `temporary_schedule` (an object with UTC `begin`/`end`, or null) and `credential_status` (Alarm.com's numeric status, or null). No PIN, raw access document, or arbitrary server description is returned. Status values are not translated into undocumented synchronization guarantees. A null temporary schedule does not mean access is unrestricted; another access type may apply.
+
+This is a standard HA action with response data. An existing MCP connection that supports those actions can call it without integration-specific MCP code. Reading confirms what Alarm.com reports, not enforcement or completed synchronization on every lock/panel. User/system name pickers and unrestricted/weekly access management remain outside this build.
 
 ---
 
@@ -79,14 +197,21 @@ Where possible, use **locally controlled Home Assistant integrations** for autom
 | Device Type  | Actions                               | Status | Low Battery | Malfunction | Notes                                                                     |
 | ------------ | ------------------------------------- | ------ | ----------- | ----------- | ------------------------------------------------------------------------- |
 | Alarm System | Arm Away, Arm Stay, Arm Night, Disarm | ✔      | ✔           | ✔           |                                                                           |
-| Garage Door  | Open, Close                           | ✔      | ✔           | ✔           |                                                                           |
-| Gate         | Open, Close                           | ✔      | ✔           | ✔           |                                                                           |
-| Light        | On / Off / Brightness                 | ✔      | ✔           | ✔           | Supports auto-off timers - see below                                     |
-| Lock         | Lock, Unlock                          | ✔      | ✔           | ✔           | Tracks who unlocked via keypad code - see below                          |
-| Sensor       | None                                  | ✔      | ✔           | ✔           | Contact sensors will not report repeated changes within a 3 minute window |
+| Garage Door  | Open, Close                           | ✔      | ✔           | ✔           | See MyQ / Security+ 3.0 note below                                       |
+| Gate         | Open, Close                           | ✔      | ✔           | ✔           | See MyQ note below                                                        |
+| Light        | On / Off / Brightness                 | ✔      | ✔           | ✔           |                                                                           |
+| Lock         | Lock, Unlock                          | ✔      | ✔           | ✔           |                                                                           |
+| Sensor       | None                                  | ✔      | ✔           | ✔           | Updates depend on the device events reported by Alarm.com |
 | Thermostat   | Heat, Cool, Auto, Fan                 | ✔      | ✔           | ✔           | Fan-only mode runs for the maximum duration supported by Alarm.com        |
 | Water Valve  | Open, Close                           | ✔      | ✔           | ✔           |                                                                           |
-| Camera       | Live WebRTC stream, Snapshot          | ✔      | —           | —           | Requires the `www/alarm-webrtc-card.js` Lovelace card                    |
+| Camera       | Live WebRTC stream, Snapshot          | ✔      | -           |-           | Live playback uses the bundled `custom:alarm-webrtc-card`; snapshots depend on camera support                    |
+
+> [!NOTE]
+> **Garage Doors (MyQ):** MyQ garage doors don't natively integrate with Home Assistant, but they do through Alarm.com, making this integration useful if that's what you have. A dedicated local solution like [RATGDO](https://paulwieland.github.io/ratgdo/) is generally preferable for local control.
+>
+>  However, if your opener uses **Security+ 3.0** (newer Chamberlain and LiftMaster models), no local solution currently supports it. This integration may be your only path to Home Assistant control.
+>
+> **Gates (MyQ):** MyQ gates use Security+ 2.0 with dry-contact wiring, there is no Security+ 3.0 gate. RATGDO and similar adapters can work with them, see the [RATGDO wiring guide](https://ratcloud.llc/pages/wiring) for specifics.
 
 ---
 
@@ -110,96 +235,14 @@ https://github.com/SeloraHomes/ha-alarmdotcom/issues
 
 ---
 
-# Installation
-
-## Install Using HACS (Recommended)
-
-1. Open **HACS**
-2. Navigate to **Integrations**
-3. Click the **three-dot menu**
-4. Select **Custom repositories**
-5. Add the repository:
-
-```
-https://github.com/SeloraHomes/ha-alarmdotcom
-```
-
-6. Select **Integration** as the category
-7. Click **Add**
-8. Install **Alarm.com**
-9. Restart Home Assistant
-
-After restarting:
-
-**Settings → Devices & Services → Add Integration → Alarm.com**
-
-## Removal
-
-1. **Settings → Devices & Services → Alarm.com**
-2. Click the three-dot menu on the integration card → **Delete**
-3. If installed via HACS and you want to remove the integration's files as well (not just the config entry), go to **HACS → Integrations → Alarm.com → three-dot menu → Remove**
-4. If you added the WebRTC Lovelace card (`www/alarm-webrtc-card.js`), remove it from your dashboard resources (**Settings → Dashboards → three-dot menu → Resources**) and delete the file from your `www/` folder
-
-Removing the integration also removes its entities and the devices they were attached to. It does not affect your Alarm.com account itself or any settings configured directly through Alarm.com's own app or website.
-
----
-
-# Configuration
-
-When adding the integration you will be prompted for:
-
-| Parameter | Required | Description                |
-| --------- | -------- | -------------------------- |
-| Username  | Yes      | Alarm.com account username |
-| Password  | Yes      | Alarm.com account password |
-
-If your account uses two-factor authentication, you are then asked to pick how to receive the one-time password (e.g. SMS or email) and to enter it. The device is then trusted, so you are not asked again on every login.
-
----
-
-# Integration Options
-
-These settings can be modified later using the **Configure** button on the Alarm.com integration card.
-
-| Parameter                     | Description                                                                                     |
-| ----------------------------- | ----------------------------------------------------------------------------------------------- |
-| Security Code                 | Code required to arm/disarm the alarm and unlock locks from Home Assistant                      |
-| Arm Home / Away / Night       | Per arming mode, any of: **Force Bypass** (bypass open zones), **No Entry Delay**, **Arm Silently** |
-| Activity Poll Interval        | See [Polling Intervals](#polling-intervals) below                                               |
-| Full State Poll Interval      | See [Polling Intervals](#polling-intervals) below                                               |
-| Camera Token Refresh Interval | See [Polling Intervals](#polling-intervals) below                                               |
-
-Some Alarm.com providers may restrict combinations of these options.
-
----
-
-# Services
-
-This integration exposes the following services, callable from **Developer Tools → Actions**, automations, or scripts.
-
-| Service                       | Purpose                                                          | Target                        |
-| ------------------------------ | ----------------------------------------------------------------- | ------------------------------ |
-| `alarmdotcom.bypass_sensor`    | Bypass a supported sensor (e.g. a door left open) for the current arm period | `resource_id` field (see the sensor entity's `resource_id` attribute), optional `partition_id` |
-| `alarmdotcom.unbypass_sensor`  | Remove a bypass from a sensor                                    | Same as above                 |
-| `alarmdotcom.set_auto_off`     | Schedule one or more lights to turn off after a duration - see [Auto-Off Timers](#auto-off-timers) below | Standard entity target picker, restricted to this integration's lights |
-| `alarmdotcom.cancel_auto_off`  | Cancel a pending auto-off timer                                  | Same as above                 |
-
-`bypass_sensor`/`unbypass_sensor` take a `resource_id`, not an `entity_id` - find this in the sensor entity's own `resource_id` attribute (Settings → Devices & Services → Alarm.com → the sensor entity → Attributes). `set_auto_off`/`cancel_auto_off` use Home Assistant's standard entity target selector instead, since they operate on lights specifically and Home Assistant already has a rich picker for that.
-
----
-
 # Camera Support
 
 This integration includes WebRTC live-streaming support for Alarm.com cameras.
 
 ## Setup
 
-1. Copy `www/alarm-webrtc-card.js` from this repository to your Home Assistant `www/` folder.
-2. Add it as a Lovelace resource:
-   - Go to **Settings → Dashboards → Resources**
-   - Click **Add Resource**
-   - URL: `/local/alarm-webrtc-card.js`
-   - Type: **JavaScript module**
+1. The camera card is bundled with the integration and served from `/alarmdotcom/alarm-webrtc-card.js`.
+2. In storage-mode dashboards the integration attempts to register the JavaScript module automatically. If you manage resources in YAML or automatic registration is unavailable, add that URL as a **JavaScript module** in your dashboard resources.
 3. Add the card to any Lovelace dashboard:
 
 ```yaml
@@ -209,9 +252,11 @@ entity: camera.your_camera_name
 
 ## How it works
 
-When the card loads it calls the `camera.turn_on` service which fetches a fresh set of WebRTC tokens from Alarm.com. Tokens are refreshed automatically in the background (every 30 minutes by default, configurable via **Configure**) so the stream is always ready. If a token expires before the next scheduled refresh the card requests new tokens automatically.
+When the card loads it requests WebRTC credentials through an authenticated Home Assistant websocket command, with camera entity read-permission checks. Tokens are never exposed as entity attributes or stored in recorder history. The card requests refreshed credentials when reconnecting.
 
-Still image snapshots are also available, which means the camera will display a thumbnail in the Home Assistant media browser and picture-glance dashboard cards.
+Still-image snapshots are requested when supported by the camera and Alarm.com endpoint. Snapshot availability varies by device and account.
+
+A camera listed in the Alarm.com account may not yet be physically installed or online. In that case, an `Empty stream info returned` warning can occur because no usable stream is available. The warning is throttled per camera. It does not by itself indicate an integration setup failure. If an installed camera streams in the Alarm.com app but not Home Assistant, report that separately.
 
 ---
 
@@ -331,7 +376,9 @@ Filter by `trigger.event.data.event_type_name` (e.g. `ArmedStay`, `DoorUnlocked`
 
 ---
 
-# Polling Intervals
+# Data Updates
+
+This integrations uses both Cloud Push and Cloud Polling.
 
 A few things run on a timer rather than arriving live over the websocket. All are configurable via the **Configure** button on the Alarm.com integration card:
 
@@ -342,6 +389,21 @@ A few things run on a timer rather than arriving live over the websocket. All ar
 | Camera token refresh interval  | 30 minutes | How often each camera's WebRTC tokens are renewed; lower it if streams stop working before the next refresh |
 
 The activity poll interval in particular is worth understanding before turning it down further: it hits an entirely undocumented Alarm.com endpoint with no confirmed rate-limit information. The default of 15 seconds is a deliberate tradeoff for a prompt welcome-home automation experience, not a guarantee it's safe at any value - if you ever run into problems, this is the first thing worth dialing back up.
+
+The rest of the entities in this integration are Cloud Push.
+
+---
+
+# Removing This Integration
+
+Removing this integration is the same as most HACS integrations:
+
+- Go to **Settings** → **Devices & Services**
+- Find the **Alarm.com** integration card
+- Click the **three-dot menu** on the card and select **Delete**
+- Repeat for any additional Alarm.com entries
+- Go to HACS, select the three-dot menu for this integration, then select **Remove**.
+- Then restart Home Assistant to clear the cache
 
 ---
 
@@ -429,6 +491,7 @@ Planned areas of development include:
 * Expanded automation and scene support
 * Additional device diagnostics and status reporting
 * Continued compatibility updates for new Home Assistant releases
+* Maybe submission of this custom integration as a core integration
 
 Community testing and feedback help guide development priorities.
 
@@ -447,6 +510,27 @@ When reporting issues include:
 * Home Assistant version
 * Integration version
 * Relevant Home Assistant logs
+* Diagnostics of your alarm.com config entry
+
+---
+
+# Maintainer
+
+This integration is currently maintained by:
+
+**Chris Pulliam**
+GitHub: https://github.com/ibasebcast
+
+The maintainer of this fork operates Alarm.com systems professionally and has access to multiple Alarm.com environments, allowing testing across a wider variety of devices and system configurations.
+
+The goal of this project is to ensure the Alarm.com ecosystem remains usable within Home Assistant as the platform evolves.
+
+This fork exists to provide:
+
+* Continued compatibility with new Home Assistant versions
+* Expanded device support
+* Improved reliability and error handling
+* Long-term maintenance of the integration
 
 ## Development
 

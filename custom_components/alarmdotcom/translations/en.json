@@ -30,9 +30,10 @@
             },
             "otp_submit": {
                 "title": "Verify Your Identity",
-                "description": "Enter the one-time code {destination}.",
+                "description": "Enter the one-time code {destination}. For SMS or email, select Send another code and submit if your code has not arrived.\n\n{resend_status}",
                 "data": {
-                    "otp": "Security Code"
+                    "otp": "Security Code",
+                    "resend_code": "Send another code (SMS/email)"
                 }
             },
             "reauth_confirm": {
@@ -88,6 +89,38 @@
                 "app": "Authenticator App",
                 "sms": "Text Message (SMS)",
                 "email": "Email Address"
+            }
+        }
+    },
+    "device_automation": {
+        "trigger_type": {
+            "scene_action": "Scene action on {subtype}"
+        },
+        "trigger_subtype": {
+            "scene_001": "Scene 001 (on button)",
+            "scene_002": "Scene 002 (off button)"
+        },
+        "extra_fields": {
+            "value": "Value"
+        }
+    },
+    "services": {
+        "get_temporary_user_schedule": {
+            "name": "Get temporary user schedule",
+            "description": "Read the saved schedule and Alarm.com's numeric credential status without returning a PIN. This does not confirm synchronization on every device.",
+            "fields": {
+                "config_entry_id": {
+                    "name": "Alarm.com account",
+                    "description": "Select the loaded Alarm.com configuration entry."
+                },
+                "system_id": {
+                    "name": "System ID",
+                    "description": "System ID belonging to the selected account."
+                },
+                "user_id": {
+                    "name": "User ID",
+                    "description": "Existing user ID from the portal user page URL."
+                }
             }
         }
     }

@@ -28,8 +28,6 @@ ATTR_RESOURCE_ID = "resource_id"
 ATTR_PARTITION_ID = "partition_id"
 ATTR_DURATION = "duration"
 
-DATA_AUTO_OFF = "auto_off_manager"
-DATA_ACTIVITY_FEED = "activity_feed_tracker"
 
 MIGRATE_MSG_ALERT = (
     "The Alarm.com integration is now configured exclusively via Home Assistant's"
@@ -86,7 +84,6 @@ CONF_OPTIONS_DEFAULT = {
     CONF_CAMERA_TOKEN_REFRESH_INTERVAL: 30,
 }
 
-DATA_HUB = "connection"
 
 ATTRIB_BATTERY_NORMAL = "Normal"
 ATTRIB_BATTERY_LOW = "Low"
@@ -105,6 +102,7 @@ PLATFORMS = [
     Platform.CLIMATE,
     Platform.VALVE,
     Platform.CAMERA,
+    Platform.EVENT,
 ]
 
 # #
@@ -113,3 +111,8 @@ PLATFORMS = [
 
 CONF_CAMERA_MFA_CODE = "mfa_code"
 CONF_CAMERA_MFA_COOKIE = "mfa_cookie"
+
+# Central Scene key attributes follow Z-Wave JS naming. Scene 1 is the up/on
+# paddle and scene 2 the down/off paddle on supported switches.
+EVENT_SCENE = "alarmdotcom_scene"
+SCENE_ACTIONS = ("KeyPressed", "KeyReleased", "KeyHeldDown", "KeyPressed2x", "KeyPressed3x", "KeyPressed4x", "KeyPressed5x")

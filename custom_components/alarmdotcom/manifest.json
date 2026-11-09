@@ -1,6 +1,10 @@
 {
   "domain": "alarmdotcom",
   "name": "Alarm.com",
+  "after_dependencies": [
+    "http",
+    "lovelace"
+  ],
   "codeowners": [
     "@ibasebcast"
   ],
@@ -8,8 +12,9 @@
   "dependencies": [],
   "documentation": "https://github.com/SeloraHomes/ha-alarmdotcom",
   "integration_type": "hub",
-  "iot_class": "cloud_polling",
+  "iot_class": "cloud_push",
   "issue_tracker": "https://github.com/SeloraHomes/ha-alarmdotcom/issues",
+  "quality_scale": "silver",
   "requirements": [
     "beautifulsoup4>=4.10.0",
     "click>=8.0.0",

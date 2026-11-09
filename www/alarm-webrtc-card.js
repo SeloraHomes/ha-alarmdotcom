@@ -1,4 +1,4 @@
-console.error("ALARM WEBRTC CARD LOADED v2026.7.6");
+// Alarm.com WebRTC card: tokens are retrieved over authenticated HA websocket.
 
 class AlarmWebRTCCard extends HTMLElement {
   constructor() {
@@ -7,6 +7,8 @@ class AlarmWebRTCCard extends HTMLElement {
     this._connecting = false;
     this._requesting = false;
     this._currentConfig = null;
+    this._secureConfig = null;
+    this._requestSerial = 0;
     this._requestTimeout = null;
     this._retryTimer = null;
     this._retryCount = 0;
@@ -17,10 +19,13 @@ class AlarmWebRTCCard extends HTMLElement {
     this.remoteId = null;
     this._janusKeepalive = null;
     this._entityId = null;
+    this._disconnectGrace = null;
+    this._streamGeneration = 0;
   }
 
   _log(...args) {
-    console.error(`[AlarmWebRTC ${this._entityId || "unknown"}]`, ...args);
+    // Never print stream configuration, tokens, or signaling payloads.
+    if (this.config?.debug) console.debug(`[AlarmWebRTC ${this._entityId || "unknown"}]`, args.length ? String(args[0]) : "event");
   }
 
   // Several Alarm.com camera models offer H.264 at a profile-level-id (e.g. 4d4028,
@@ -49,22 +54,38 @@ class AlarmWebRTCCard extends HTMLElement {
   // matching only the literal value seen on one test camera silently does nothing for
   // every other model - matching the mixed results reported in #38, where the original
   // fix worked for some users' cameras but not others'.
+  // Some models (ADC-V724x, ADC-VDB770) send an H.264 fmtp line with no profile-level-id
+  // at all, which the decoder reads as the RFC 6184 default (Baseline 1.0) and iOS renders
+  // black, so the id is also added to any H.264 payload that lacks one (#112).
   _patchAppleOfferSdp(sdp) {
     if (!sdp) return sdp;
-    return sdp.replace(/profile-level-id=[0-9a-fA-F]{6}/g, "profile-level-id=42e01f");
+    sdp = sdp.replace(/profile-level-id=[0-9a-fA-F]{6}/g, "profile-level-id=42e01f");
+    for (const m of [...sdp.matchAll(/a=rtpmap:(\d+) H264\/90000/gi)]) {
+      const pt = m[1];
+      const fmtp = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
+      const f = sdp.match(fmtp);
+      if (f) {
+        if (!/profile-level-id/i.test(f[1])) sdp = sdp.replace(fmtp, `a=fmtp:${pt} ${f[1]};profile-level-id=42e01f`);
+      } else {
+        sdp = sdp.replace(m[0], `${m[0]}\r\na=fmtp:${pt} profile-level-id=42e01f`);
+      }
+    }
+    return sdp;
   }
 
   setConfig(config) {
     if (!config.entity) throw new Error("Entity required");
     this.config = config;
     this._entityId = config.entity;
-    this._log("setConfig", config);
+    this._requestSerial += 1;
+    this._secureConfig = null;
+    this._log("setConfig");
   }
 
   set hass(hass) {
     this._hass = hass;
     const entityId = this.config?.entity;
-    if (!entityId) return;
+    if (!entityId || !this.isConnected) return;
 
     this._entityId = entityId;
 
@@ -74,7 +95,7 @@ class AlarmWebRTCCard extends HTMLElement {
       return;
     }
 
-    let config = stateObj.attributes?.webrtc_config;
+    let config = this._secureConfig;
     // Allow card config to override the Janus stream ID (useful for cameras
     // where the API doesn't expose the correct mountpoint ID).
     if (config && this.config?.janusStreamId != null) {
@@ -97,15 +118,12 @@ class AlarmWebRTCCard extends HTMLElement {
     );
 
     if (!isValid) {
-      if (!this._requesting && !this._connecting) {
+      if (!this._requesting && !this._connecting && !this._retryTimer && this._retryCount < this._maxRetries) {
         this._requestTokens("No valid config");
       }
       return;
     }
 
-    const hasNoCurrentConfig = !this._currentConfig;
-    const isNewConfig =
-      JSON.stringify(config) !== JSON.stringify(this._currentConfig);
     const streamTypeChanged =
       config?.streamType !== this._currentConfig?.streamType;
 
@@ -117,8 +135,7 @@ class AlarmWebRTCCard extends HTMLElement {
 
     const shouldStartFresh =
       !this._connected &&
-      !this._connecting &&
-      (hasNoCurrentConfig || isNewConfig || streamTypeChanged);
+      !this._connecting;
 
     const shouldRestart =
       isStructuralChange &&
@@ -161,10 +178,29 @@ class AlarmWebRTCCard extends HTMLElement {
 
   renderVideo() {
     this.innerHTML = `
-      <ha-card>
-        <video autoplay playsinline muted style="width:100%;height:auto;background:#000"></video>
+      <ha-card style="position:relative;background:#000">
+        <style>
+          ha-card:fullscreen { width:100vw; height:100vh; display:flex; align-items:center; }
+          ha-card:fullscreen video { max-height:100vh; object-fit:contain; }
+        </style>
+        <video autoplay playsinline muted style="width:100%;height:auto;background:#000;display:block"></video>
+        <button type="button" aria-label="Toggle fullscreen" title="Toggle fullscreen"
+          style="position:absolute;right:8px;bottom:8px;padding:8px;border:0;border-radius:4px;background:#0009;color:#fff;cursor:pointer">⛶</button>
       </ha-card>
     `;
+    this.querySelector("button").addEventListener("click", () => this._toggleFullscreen());
+  }
+
+  async _toggleFullscreen() {
+    const frame = this.querySelector("ha-card");
+    const video = this.querySelector("video");
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else if (frame?.requestFullscreen) await frame.requestFullscreen();
+      else if (video?.webkitEnterFullscreen) video.webkitEnterFullscreen();
+    } catch {
+      this._log("Fullscreen unavailable");
+    }
   }
 
   _showReconnectButton(message = "Stream unavailable") {
@@ -194,7 +230,15 @@ class AlarmWebRTCCard extends HTMLElement {
   }
 
   _scheduleRetry(reason) {
-    if (this._retryTimer) return;
+    if (this._retryTimer || !this.isConnected) return;
+
+    // A retry starts a new session, never a replay of rejected credentials.
+    // Invalidate pending callbacks before closing either transport.
+    clearTimeout(this._requestTimeout);
+    this._requestSerial += 1;
+    this._requesting = false;
+    this._secureConfig = null;
+    this._teardownStream();
 
     if (this._retryCount >= this._maxRetries) {
       this._log("Max retries reached", reason);
@@ -217,32 +261,49 @@ class AlarmWebRTCCard extends HTMLElement {
   }
 
   _requestTokens(reason) {
-    if (this._requesting) return;
+    if (this._requesting || !this.isConnected) return;
 
     this._log("Requesting tokens", reason);
     this._requesting = true;
 
     clearTimeout(this._requestTimeout);
+    const requestEntity = this.config.entity;
+    const requestSerial = ++this._requestSerial;
     this._requestTimeout = setTimeout(() => {
+      if (requestSerial !== this._requestSerial) return;
       this._log("Token request timed out");
+      this._requestSerial += 1;
       this._requesting = false;
       this._scheduleRetry("Token timeout");
     }, 15000);
 
-    this._hass
-      .callService("camera", "turn_on", {
-        entity_id: this.config.entity,
-      })
-      .catch((err) => {
-        this._log("turn_on failed", err);
-        this._requesting = false;
-        this._scheduleRetry("turn_on failed");
-      });
+    this._hass.connection.sendMessagePromise({
+      type: "alarmdotcom/webrtc_config",
+      entity_id: requestEntity,
+    }).then((config) => {
+      if (this.config.entity !== requestEntity || requestSerial !== this._requestSerial) return;
+      clearTimeout(this._requestTimeout);
+      this._requesting = false;
+      if (!this.isConfigValid(config)) {
+        this._scheduleRetry("Invalid stream configuration");
+        return;
+      }
+      this._secureConfig = config;
+      this.hass = this._hass;
+    }).catch(() => {
+      if (this.config.entity !== requestEntity || requestSerial !== this._requestSerial) return;
+      clearTimeout(this._requestTimeout);
+      this._log("WebRTC credential request failed");
+      this._requesting = false;
+      this._scheduleRetry("Credential request failed");
+    });
 
     this.renderPlaceholder("Refreshing session...");
   }
 
   _teardownStream(resetConfig = true) {
+    // Invalidate old callbacks before closing: a late close must not kill a replacement stream.
+    this._streamGeneration += 1;
     if (this._janusKeepalive) {
       clearInterval(this._janusKeepalive);
       this._janusKeepalive = null;
@@ -250,6 +311,9 @@ class AlarmWebRTCCard extends HTMLElement {
 
     if (this.pc) {
       try {
+        this.pc.ontrack = null;
+        this.pc.onicecandidate = null;
+        this.pc.oniceconnectionstatechange = null;
         this.pc.close();
       } catch (e) {}
       this.pc = null;
@@ -257,6 +321,9 @@ class AlarmWebRTCCard extends HTMLElement {
 
     if (this.ws) {
       try {
+        this.ws.onclose = null;
+        this.ws.onmessage = null;
+        this.ws.onerror = null;
         this.ws.close();
       } catch (e) {}
       this.ws = null;
@@ -289,9 +356,10 @@ class AlarmWebRTCCard extends HTMLElement {
     if (this._connecting) return;
 
     this._connecting = true;
+    const generation = this._streamGeneration;
     this._currentConfig = config;
 
-    this._log("Starting stream", config);
+    this._log("Starting stream");
 
     try {
       if (config.streamType === "janus" || config.janusGatewayUrl) {
@@ -302,6 +370,7 @@ class AlarmWebRTCCard extends HTMLElement {
         await this._startLegacy(config);
       }
     } catch (err) {
+      if (generation !== this._streamGeneration) return;
       this._log("startStream failed", err);
       this._teardownStream(false);
       this._requesting = false;
@@ -310,6 +379,7 @@ class AlarmWebRTCCard extends HTMLElement {
   }
 
   async _startLegacy(config) {
+    const generation = this._streamGeneration;
     const pc = new RTCPeerConnection({
       iceServers: config.iceServers || [],
     });
@@ -330,6 +400,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     pc.ontrack = (e) => {
+      if (generation !== this._streamGeneration) return;
       if (!video.srcObject) {
         video.srcObject = e.streams[0];
         this._markConnected();
@@ -339,6 +410,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     pc.oniceconnectionstatechange = () => {
+      if (generation !== this._streamGeneration) return;
       const s = pc.iceConnectionState;
       this._log("Legacy ICE state", s);
       if (s === "disconnected" || s === "failed" || s === "closed") {
@@ -353,6 +425,7 @@ class AlarmWebRTCCard extends HTMLElement {
     this.ws = ws;
 
     ws.onopen = () => {
+      if (generation !== this._streamGeneration) return;
       this._log("Legacy WS connected");
       ws.send("HELLO 2.0.1");
     };
@@ -362,6 +435,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     ws.onmessage = async (msg) => {
+      if (generation !== this._streamGeneration) return;
       if (msg.data.startsWith("HELLO")) {
         ws.send(`START_SESSION ${config.cameraAuthToken}`);
         return;
@@ -378,6 +452,12 @@ class AlarmWebRTCCard extends HTMLElement {
         return;
       }
 
+      if (data.error) {
+        // Use a fixed reason: server errors may include sensitive session data.
+        this._scheduleRetry("Signaling rejected session");
+        return;
+      }
+
       if (data.sdp?.type === "offer") {
         let remoteOffer = data.sdp;
 
@@ -390,8 +470,11 @@ class AlarmWebRTCCard extends HTMLElement {
         }
 
         await pc.setRemoteDescription(remoteOffer);
+        if (generation !== this._streamGeneration) return;
         const answer = await pc.createAnswer();
+        if (generation !== this._streamGeneration) return;
         await pc.setLocalDescription(answer);
+        if (generation !== this._streamGeneration) return;
 
         // Wait for ICE gathering to complete before sending answer,
         // so the SDP includes TURN relay candidates.
@@ -422,6 +505,7 @@ class AlarmWebRTCCard extends HTMLElement {
       if (data.ice) {
         try {
           await pc.addIceCandidate(data.ice);
+        if (generation !== this._streamGeneration) return;
         } catch (e) {
           this._log("Failed to add ICE candidate", e);
         }
@@ -429,6 +513,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     ws.onclose = () => {
+      if (generation !== this._streamGeneration) return;
       const wasConnected = this._connected;
       this._log("Legacy WS closed");
       this._connected = false;
@@ -527,6 +612,7 @@ class AlarmWebRTCCard extends HTMLElement {
   }
 
   async _startJanus(config) {
+    const generation = this._streamGeneration;
     const pc = new RTCPeerConnection({
       iceServers: config.iceServers || [],
     });
@@ -547,6 +633,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     pc.ontrack = (e) => {
+      if (generation !== this._streamGeneration) return;
       if (!video.srcObject) {
         video.srcObject = e.streams[0];
         this._markConnected();
@@ -556,6 +643,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     pc.oniceconnectionstatechange = () => {
+      if (generation !== this._streamGeneration) return;
       const s = pc.iceConnectionState;
       this._log("Janus ICE state", s);
       if (s === "disconnected" || s === "failed" || s === "closed") {
@@ -565,6 +653,10 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     const ws = await this._openJanusWebSocket(config);
+    if (generation !== this._streamGeneration) {
+      ws.close();
+      return;
+    }
     this.ws = ws;
 
     let sessionId = null;
@@ -596,6 +688,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     ws.onmessage = async (event) => {
+      if (generation !== this._streamGeneration) return;
       let msg;
       try {
         msg = JSON.parse(event.data);
@@ -712,9 +805,12 @@ class AlarmWebRTCCard extends HTMLElement {
         }
 
         await pc.setRemoteDescription(remoteJsep);
+        if (generation !== this._streamGeneration) return;
 
         const answer = await pc.createAnswer();
+        if (generation !== this._streamGeneration) return;
         await pc.setLocalDescription(answer);
+        if (generation !== this._streamGeneration) return;
 
         send({
           janus: "message",
@@ -729,6 +825,7 @@ class AlarmWebRTCCard extends HTMLElement {
       if (msg.candidate) {
         try {
           await pc.addIceCandidate(msg.candidate);
+        if (generation !== this._streamGeneration) return;
         } catch (err) {
           this._log("Failed to add Janus candidate", err);
         }
@@ -768,6 +865,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     pc.onicecandidate = (e) => {
+      if (generation !== this._streamGeneration) return;
       if (e.candidate && sessionId && handleId) {
         send({
           janus: "trickle",
@@ -779,6 +877,7 @@ class AlarmWebRTCCard extends HTMLElement {
     };
 
     ws.onclose = () => {
+      if (generation !== this._streamGeneration) return;
       const wasConnected = this._connected;
       this._log("Janus WS closed");
       this._connected = false;
@@ -791,18 +890,36 @@ class AlarmWebRTCCard extends HTMLElement {
     };
   }
 
-  disconnectedCallback() {
-    clearTimeout(this._requestTimeout);
+  connectedCallback() {
+    // Lovelace reparents cards during phone rotation. Keep the peer connection
+    // alive if the same card returns within one second, then resume playback.
+    clearTimeout(this._disconnectGrace);
+    this._disconnectGrace = null;
+    const video = this.querySelector("video");
+    if (video?.srcObject && video.paused) video.play().catch(() => {});
+    // A genuine dashboard return gets a fresh retry budget. Reparenting an
+    // active stream during rotation must keep its existing session intact.
+    if (!this._connected && !this._connecting && !this._requesting) this._retryCount = 0;
+    if (this._hass) this.hass = this._hass;
+  }
 
-    if (this._retryTimer) {
+  disconnectedCallback() {
+    clearTimeout(this._disconnectGrace);
+    this._disconnectGrace = setTimeout(() => {
+      this._disconnectGrace = null;
+      if (this.isConnected) return;
+      clearTimeout(this._requestTimeout);
       clearTimeout(this._retryTimer);
       this._retryTimer = null;
-    }
-
-    this._teardownStream();
-    this._requesting = false;
-    this._connecting = false;
+      this._requestSerial += 1;
+      this._secureConfig = null;
+      this._teardownStream();
+      this._requesting = false;
+      this._connecting = false;
+    }, 1000);
   }
 }
 
-customElements.define("alarm-webrtc-card", AlarmWebRTCCard);
+if (!customElements.get("alarm-webrtc-card")) {
+  customElements.define("alarm-webrtc-card", AlarmWebRTCCard);
+}
