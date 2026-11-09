@@ -82,8 +82,10 @@ def async_register_access_service(hass: HomeAssistant) -> None:
             raise HomeAssistantError("Could not read the access schedule from Alarm.com.") from None
         return result
 
-    hass.services.async_register(
-        DOMAIN, SERVICE_GET_TEMPORARY_USER_SCHEDULE, read_schedule,
+    # Admin-only like the write: the schedule and credential status of a
+    # household member are not something every Home Assistant user should see.
+    async_register_admin_service(
+        hass, DOMAIN, SERVICE_GET_TEMPORARY_USER_SCHEDULE, read_schedule,
         schema=vol.Schema({
             vol.Required("config_entry_id"): cv.string,
             vol.Required("system_id"): cv.string,

@@ -294,3 +294,26 @@ async def test_read_service_blocks_wrong_account_and_redacts_failures(hass):
     with pytest.raises(HomeAssistantError) as error:
         await hass.services.async_call(DOMAIN, "get_temporary_user_schedule", data, blocking=True, return_response=True)
     assert "private-pin-sentinel" not in str(error.value)
+
+
+async def test_schedule_read_requires_an_admin_user(hass):
+    """A household member's schedule is not readable by non-admin users."""
+    entry = account(hass, "Account")
+    admin = await hass.auth.async_create_user("Admin", group_ids=[GROUP_ID_ADMIN])
+    user = await hass.auth.async_create_user("User", group_ids=[GROUP_ID_USER])
+    read = entry.runtime_data.hub.api.device_access.get_temporary_user_schedule = AsyncMock(return_value={})
+    async_register_access_service(hass)
+    data = {"config_entry_id": entry.entry_id, "system_id": SYSTEM, "user_id": USER}
+
+    with pytest.raises(Unauthorized):
+        await hass.services.async_call(
+            DOMAIN, "get_temporary_user_schedule", data, blocking=True,
+            context=Context(user_id=user.id), return_response=True,
+        )
+    read.assert_not_awaited()
+
+    await hass.services.async_call(
+        DOMAIN, "get_temporary_user_schedule", data, blocking=True,
+        context=Context(user_id=admin.id), return_response=True,
+    )
+    read.assert_awaited_once()
