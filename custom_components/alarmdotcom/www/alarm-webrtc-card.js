@@ -173,7 +173,9 @@ class AlarmWebRTCCard extends HTMLElement {
 
   renderPlaceholder(msg) {
     if (this._connected) return;
-    this.innerHTML = `<ha-card><div style="padding:16px;text-align:center">${msg}</div></ha-card>`;
+    this.innerHTML = `<ha-card><div style="padding:16px;text-align:center"></div></ha-card>`;
+    // Messages can carry text from the Janus gateway; never parse them as HTML.
+    this.querySelector("ha-card > div").textContent = msg;
   }
 
   renderVideo() {
@@ -207,10 +209,13 @@ class AlarmWebRTCCard extends HTMLElement {
     this.innerHTML = `
       <ha-card>
         <div style="padding:16px;text-align:center">
-          <div style="margin-bottom:12px;color:#888">${message}</div>
+          <div id="reconnect-msg" style="margin-bottom:12px;color:#888"></div>
           <button id="reconnect-btn" style="padding:8px 20px;background:var(--primary-color,#03a9f4);color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:14px">Reconnect</button>
         </div>
       </ha-card>`;
+
+    // Messages can carry text from the Janus gateway; never parse them as HTML.
+    this.querySelector("#reconnect-msg").textContent = message;
 
     this.querySelector("#reconnect-btn").addEventListener("click", () => {
       this._log("Manual reconnect");

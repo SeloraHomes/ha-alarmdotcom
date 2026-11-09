@@ -152,7 +152,7 @@
         },
         "get_temporary_user_schedule": {
             "name": "Get temporary user schedule",
-            "description": "Read the saved schedule and Alarm.com's numeric credential status without returning a PIN. This does not confirm synchronization on every device.",
+            "description": "Read the saved schedule and Alarm.com's numeric credential status without returning a PIN. Requires a Home Assistant administrator. This does not confirm synchronization on every device.",
             "fields": {
                 "config_entry_id": {
                     "name": "Alarm.com account",

@@ -175,7 +175,7 @@ and end times in ISO 8601 with `Z` or an explicit UTC offset.
 
 ### Read a temporary user's saved schedule
 
-The response-only `alarmdotcom.get_temporary_user_schedule` action accepts the same account, system ID, and user ID as the write action. In a script:
+The admin-only, response-only `alarmdotcom.get_temporary_user_schedule` action accepts the same account, system ID, and user ID as the write action. In a script:
 
 ```yaml
 - action: alarmdotcom.get_temporary_user_schedule
@@ -188,7 +188,7 @@ The response-only `alarmdotcom.get_temporary_user_schedule` action accepts the s
 
 Response fields are `temporary_schedule` (an object with UTC `begin`/`end`, or null) and `credential_status` (Alarm.com's numeric status, or null). No PIN, raw access document, or arbitrary server description is returned. Status values are not translated into undocumented synchronization guarantees. A null temporary schedule does not mean access is unrestricted; another access type may apply.
 
-This is a standard HA action with response data. An existing MCP connection that supports those actions can call it without integration-specific MCP code. Reading confirms what Alarm.com reports, not enforcement or completed synchronization on every lock/panel. User/system name pickers and unrestricted/weekly access management remain outside this build.
+This is a standard HA action with response data. An existing MCP connection that supports those actions can call it without integration-specific MCP code, provided it acts as a Home Assistant administrator. Reading confirms what Alarm.com reports, not enforcement or completed synchronization on every lock/panel. User/system name pickers and unrestricted/weekly access management remain outside this build.
 
 ---
 

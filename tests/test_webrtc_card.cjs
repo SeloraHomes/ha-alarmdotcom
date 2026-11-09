@@ -193,3 +193,18 @@ test("Janus rejection also discards credentials before retrying", async () => {
   assert.equal(card.pc, null);
   assert.equal(timers.size, 1);
 });
+
+test("gateway-supplied error text is rendered as text, never as HTML", () => {
+  const { card } = loadCard();
+  const nodes = {};
+  card.querySelector = (selector) => (nodes[selector] ??= { addEventListener: () => {} });
+  const payload = '<img src=x onerror="alert(1)">';
+
+  card._showReconnectButton(`Stream unavailable (Plugin error ${payload})`);
+  assert.ok(!card.innerHTML.includes(payload));
+  assert.equal(nodes["#reconnect-msg"].textContent, `Stream unavailable (Plugin error ${payload})`);
+
+  card.renderPlaceholder(payload);
+  assert.ok(!card.innerHTML.includes(payload));
+  assert.equal(nodes["ha-card > div"].textContent, payload);
+});
