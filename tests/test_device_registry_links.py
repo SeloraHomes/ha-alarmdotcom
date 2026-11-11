@@ -28,7 +28,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.alarmdotcom.button import _device_exists_in_registry
 from custom_components.alarmdotcom.const import DOMAIN
 from custom_components.alarmdotcom.entity import device_info_fn
-from custom_components.alarmdotcom.util import cleanup_orphaned_entities_and_devices
+from custom_components.alarmdotcom.util import cleanup_orphaned_devices, cleanup_orphaned_entities_and_devices
 
 
 @pytest.fixture
@@ -167,3 +167,33 @@ async def test_platform_cleanup_does_not_remove_devices_from_other_platforms(
     assert registry.async_get(ours_live.id) is not None
     assert registry.async_get(theirs_orphan.id) is not None
     assert entity_registry.async_get(live.entity_id) is not None
+
+
+async def test_orphaned_devices_are_removed_once_all_platforms_are_set_up(hass: HomeAssistant) -> None:
+    """Devices Alarm.com dropped while HA was down go; listed, parent and populated ones stay."""
+    entry = MockConfigEntry(domain=DOMAIN)
+    entry.add_to_hass(hass)
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+
+    def device(resource_id: str, **kwargs) -> dr.DeviceEntry:
+        return device_registry.async_get_or_create(
+            config_entry_id=entry.entry_id, identifiers={(DOMAIN, resource_id)}, **kwargs
+        )
+
+    gone = device("gone")
+    listed = device("listed")
+    with_entity = device("with-entity")
+    entity_registry.async_get_or_create(
+        "binary_sensor", DOMAIN, "with-entity", config_entry=entry, device_id=with_entity.id
+    )
+    parent = device("parent")
+    child = device("child", via_device_id=parent.id)
+    entity_registry.async_get_or_create("binary_sensor", DOMAIN, "child", config_entry=entry, device_id=child.id)
+    service = device("service", entry_type=dr.DeviceEntryType.SERVICE)
+
+    cleanup_orphaned_devices(hass, entry, {"listed"})
+
+    assert device_registry.async_get(gone.id) is None
+    for kept in (listed, with_entity, parent, child, service):
+        assert device_registry.async_get(kept.id) is not None

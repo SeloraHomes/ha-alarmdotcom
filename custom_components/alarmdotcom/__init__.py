@@ -78,6 +78,7 @@ from .const import (
 )
 from .hub import AlarmHub
 from .schema import vol
+from .util import cleanup_orphaned_devices
 from .webrtc_ws import async_register as async_register_webrtc
 
 LOGGER = logging.getLogger(__name__)
@@ -202,6 +203,7 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     )
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    cleanup_orphaned_devices(hass, config_entry, set(hub.api.managed_devices))
 
     async def handle_alarmdotcom_debug_request_event(event: Event) -> None:
         """Dump debug data when requested via Home Assistant event."""

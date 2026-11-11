@@ -196,8 +196,9 @@ rules:
   stale-devices:
     status: done
     comment: >
-      cleanup_orphaned_entities_and_devices in util.py removes devices
-      with no remaining entities on each platform setup.
+      cleanup_orphaned_devices in util.py removes devices with no remaining
+      entities once all platforms are set up; hub.py removes devices Alarm.com
+      stops listing at runtime.
       NOTE: Same as dynamic-devices — remove for the initial core PR per
       HA submission guidelines.
 
