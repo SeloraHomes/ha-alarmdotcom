@@ -208,3 +208,33 @@ test("gateway-supplied error text is rendered as text, never as HTML", () => {
   assert.ok(!card.innerHTML.includes(payload));
   assert.equal(nodes["ha-card > div"].textContent, payload);
 });
+
+test("Apple SDP patch normalises and adds H.264 profile-level-id per payload type", () => {
+  const { card } = loadCard();
+  const sdp = [
+    "v=0",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98",
+    "a=rtpmap:96 H264/90000",
+    "a=fmtp:96 packetization-mode=1;profile-level-id=4d4028",
+    "a=rtpmap:97 H264/90000",
+    "a=fmtp:97 packetization-mode=1",
+    "a=rtpmap:98 H264/90000",
+    "a=rtpmap:99 VP8/90000",
+    "a=fmtp:99 max-fr=30",
+    "",
+  ].join("\r\n");
+  assert.equal(card._patchAppleOfferSdp(sdp), [
+    "v=0",
+    "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98",
+    "a=rtpmap:96 H264/90000",
+    "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f",
+    "a=rtpmap:97 H264/90000",
+    "a=fmtp:97 packetization-mode=1;profile-level-id=42e01f",
+    "a=rtpmap:98 H264/90000",
+    "a=fmtp:98 profile-level-id=42e01f",
+    "a=rtpmap:99 VP8/90000",
+    "a=fmtp:99 max-fr=30",
+    "",
+  ].join("\r\n"));
+  assert.equal(card._patchAppleOfferSdp(""), "");
+});

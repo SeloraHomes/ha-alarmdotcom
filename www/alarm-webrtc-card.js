@@ -60,17 +60,26 @@ class AlarmWebRTCCard extends HTMLElement {
   _patchAppleOfferSdp(sdp) {
     if (!sdp) return sdp;
     sdp = sdp.replace(/profile-level-id=[0-9a-fA-F]{6}/g, "profile-level-id=42e01f");
-    for (const m of [...sdp.matchAll(/a=rtpmap:(\d+) H264\/90000/gi)]) {
-      const pt = m[1];
-      const fmtp = new RegExp(`a=fmtp:${pt} ([^\\r\\n]*)`);
-      const f = sdp.match(fmtp);
-      if (f) {
-        if (!/profile-level-id/i.test(f[1])) sdp = sdp.replace(fmtp, `a=fmtp:${pt} ${f[1]};profile-level-id=42e01f`);
-      } else {
-        sdp = sdp.replace(m[0], `${m[0]}\r\na=fmtp:${pt} profile-level-id=42e01f`);
-      }
+    // Work line by line rather than building a RegExp from the payload type.
+    const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
+    const lines = sdp.split(eol);
+    const h264 = new Set();
+    for (const line of lines) {
+      const m = /^a=rtpmap:(\d+) H264\/90000/i.exec(line);
+      if (m) h264.add(m[1]);
     }
-    return sdp;
+    const withFmtp = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^a=fmtp:(\d+) (.*)$/.exec(lines[i]);
+      if (!m || !h264.has(m[1])) continue;
+      withFmtp.add(m[1]);
+      if (!/profile-level-id/i.test(m[2])) lines[i] = `${lines[i]};profile-level-id=42e01f`;
+    }
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const m = /^a=rtpmap:(\d+) H264\/90000/i.exec(lines[i]);
+      if (m && !withFmtp.has(m[1])) lines.splice(i + 1, 0, `a=fmtp:${m[1]} profile-level-id=42e01f`);
+    }
+    return lines.join(eol);
   }
 
   setConfig(config) {
