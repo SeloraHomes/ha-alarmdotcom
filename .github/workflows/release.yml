@@ -10,7 +10,7 @@ on:
   workflow_dispatch:
     inputs:
       prerelease:
-        description: Publish a pre-release (YYYY.M.D.Nb0)
+        description: Publish a pre-release (YYYY.M.N-bK)
         type: boolean
         default: true
 
