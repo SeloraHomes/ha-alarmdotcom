@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 from bs4 import BeautifulSoup
+from yarl import URL
 
 if TYPE_CHECKING:
     from _pyalarmdotcomajax import AlarmBridge
@@ -353,6 +354,14 @@ class AlarmCameraSession:
         """Inject MFA cookie explicitly when needed."""
         return {MFA_COOKIE_KEY: self.mfa_cookie} if self.mfa_cookie else {}
 
+    def _sync_ajax_key(self, url: str) -> None:
+        """Use the current anti-forgery cookie before sending an API request."""
+        # The main bridge can renew our shared session between camera requests.
+        # Its cookie jar changes, but the key copied at camera setup does not.
+        # Sending the old header can cause a 403 and an unnecessary camera login.
+        if (afg := self.session.cookie_jar.filter_cookies(URL(url)).get("afg")) and afg.value:
+            self.ajax_key = afg.value
+
     def _extract_cookies(self, resp: aiohttp.ClientResponse) -> None:
         afg = resp.cookies.get("afg")
         if afg:
@@ -376,6 +385,8 @@ class AlarmCameraSession:
         also needs this for fetching snapshot images - it was never actually
         private in practice, just named as if it were.
         """
+        if use_ajax:
+            self._sync_ajax_key(url)
         resp = await self.session.get(
             url,
             headers=_build_headers(accept or ACCEPT_JSONAPI, self.ajax_key if use_ajax else None),
@@ -395,6 +406,8 @@ class AlarmCameraSession:
         data: dict | None = None,
         json_body: dict | None = None,
     ) -> aiohttp.ClientResponse:
+        if use_ajax:
+            self._sync_ajax_key(url)
         kwargs: dict = {
             "headers": _build_headers(
                 accept or ACCEPT_JSONAPI,
@@ -517,6 +530,21 @@ class AlarmCameraSession:
 
         return cameras
 
+    async def get_snapshot_url(self, camera_id: str) -> str | None:
+        """Request an ephemeral image URL, keeping it out of logs and HA state."""
+        resp = await self.get(f"{API_URL_BASE}video/snapshots/{camera_id}")
+        try:
+            body = await resp.json()
+        finally:
+            resp.release()
+        if not isinstance(body, dict) or not isinstance(body.get("data"), dict):
+            return None
+        attributes = body["data"].get("attributes")
+        if not isinstance(attributes, dict) or attributes.get("error"):
+            return None
+        url = attributes.get("url")
+        return url if isinstance(url, str) and url else None
+
     async def get_stream_info(self, camera_id: str) -> dict | None:
         """
         Fetch WebRTC config for a camera.
@@ -529,25 +557,12 @@ class AlarmCameraSession:
         )
         body = await resp.json()
 
-        # Off by default, regardless of the main camera_api logger's level -
-        # this fires on every WebRTC token refresh (roughly every 20-30
-        # seconds per camera) and the raw response contains live session
-        # credentials. Enable via configuration.yaml:
-        #   logger:
-        #     logs:
-        #       custom_components.alarmdotcom.camera_api.raw_responses: debug   # full, unredacted
-        #       custom_components.alarmdotcom.camera_api.raw_responses: info    # redacted summary
-        if _RAW_RESPONSE_LOGGER.isEnabledFor(logging.DEBUG):
-            _RAW_RESPONSE_LOGGER.debug(
-                "get_stream_info raw response for camera %s: %s",
-                camera_id,
-                body,
-            )
-        elif _RAW_RESPONSE_LOGGER.isEnabledFor(logging.INFO):
+        # Stream responses contain short-lived authentication secrets. Never
+        # emit raw responses, even when DEBUG logging is explicitly enabled.
+        if _RAW_RESPONSE_LOGGER.isEnabledFor(logging.INFO):
             _RAW_RESPONSE_LOGGER.info(
-                "get_stream_info response for camera %s (redacted): %s",
+                "get_stream_info response received for camera %s",
                 camera_id,
-                _redact_stream_info(body),
             )
 
         top_attrs = body.get("data", {}).get("attributes", {})
@@ -565,17 +580,8 @@ class AlarmCameraSession:
 
         included = body.get("included", [])
 
-        for inc in included:
-            if inc.get("type") == "video/videoSources/endToEndWebrtcConnectionInfo":
-                config = dict(inc.get("attributes", {}))
-                config["iceServers"] = ice_servers
-                config["streamType"] = "endToEnd"
-                _LOGGER.debug(
-                    "Found end-to-end WebRTC config for camera %s",
-                    camera_id,
-                )
-                return config
-
+        # Some cameras advertise endToEnd but never send an SDP offer (#106, #172).
+        # Prefer the working proxy path when Alarm.com supplies both credentials.
         if top_attrs.get("janusGatewayUrl") and top_attrs.get("janusToken"):
             # Find the HD stream mountpoint ID from the quality message included items.
             # Alarm.com includes webrtcStreamQualityMessage entries with a streamID field;
@@ -628,6 +634,17 @@ class AlarmCameraSession:
                 janus_stream_id,
             )
             return config
+
+        for inc in included:
+            if inc.get("type") == "video/videoSources/endToEndWebrtcConnectionInfo":
+                config = dict(inc.get("attributes", {}))
+                config["iceServers"] = ice_servers
+                config["streamType"] = "endToEnd"
+                _LOGGER.debug(
+                    "Found end-to-end WebRTC config for camera %s",
+                    camera_id,
+                )
+                return config
 
         # Name the reason, not just the shape. The key names alone say nothing
         # about *why* there is no config, and the one field that does -

@@ -19,7 +19,7 @@ Usage:
         Print `version=`, `previous=` and `releasable=` lines (GitHub Actions
         output format) and write the release notes to PATH.
     release.py stamp VERSION
-        Write VERSION into manifest.json.
+        Write VERSION into manifest.json and the bundled library's _version.py.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "custom_components" / "alarmdotcom" / "manifest.json"
+LIBRARY_VERSION = ROOT / "custom_components" / "alarmdotcom" / "_pyalarmdotcomajax" / "_version.py"
 REPO_URL = "https://github.com/SeloraHomes/ha-alarmdotcom"
 
 # YYYY.M.N[-bK], plus the earlier YYYY.M.D[.N][bK] tags.
@@ -143,12 +144,13 @@ def plan(args: argparse.Namespace) -> None:
 
 
 def stamp(args: argparse.Namespace) -> None:
-    """Write the version into manifest.json, keeping its formatting."""
+    """Write the version into manifest.json and the bundled library."""
     if not TAG.match(args.version):
         raise SystemExit(f"Not a release version: {args.version}")
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
     manifest["version"] = args.version
     MANIFEST.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    LIBRARY_VERSION.write_text(f'"""Package version."""\n\n__version__ = "{args.version}"\n', encoding="utf-8")
 
 
 def main() -> None:

@@ -4,19 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
+import time
 from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
+from urllib.parse import urlencode
 
 import aiohttp
 import humps
 from _pyalarmdotcomajax._version import __version__
+from _pyalarmdotcomajax.access import DeviceAccessManager
 from _pyalarmdotcomajax.const import (
     API_URL_BASE,
-    DEBUG_REQUEST_DUMP_MAX_LEN,
     REQUEST_RETRY_LIMIT,
     SUBMIT_RETRY_LIMIT,
     URL_BASE,
@@ -70,6 +73,7 @@ from _pyalarmdotcomajax.exceptions import (
     UnknownDevice,
     UnsupportedOperation,
 )
+from _pyalarmdotcomajax.light_discovery import summarize_light_discovery
 from _pyalarmdotcomajax.models import (
     AdcManagedDeviceT,
     AdcMiniSuccessResponse,
@@ -164,6 +168,24 @@ T = TypeVar("T", bound=JsonApiBaseElement)
 
 log = logging.getLogger(__name__)
 
+# Set while a login is running. Requests made by the login itself must not try to repair the session: the repair
+# would log in again from inside the login, and under _login_lock it waits on the lock it already holds.
+_LOGIN_IN_PROGRESS: contextvars.ContextVar[bool] = contextvars.ContextVar("adc_login_in_progress", default=False)
+
+# A login that has not finished in this long is abandoned, so a stalled Alarm.com cannot hold _login_lock forever.
+LOGIN_REPAIR_TIMEOUT_S = 60
+
+# After a failed session repair, no further login is attempted until this backoff passes; it doubles on each failure.
+# A wrong password, a changed password or a locked account would otherwise be retried by every waiting request and
+# every poll (several times a minute), which keeps the account locked.
+LOGIN_BACKOFF_INITIAL_S = 60
+LOGIN_BACKOFF_MAX_S = 30 * 60
+
+# How long a reconcile waits before fetching. Coalesces bursts (several zones changing at once, a reconnect that
+# lands with events) into one request, and lets an OpenedClosed pulse play out first.
+RECONCILE_DELAY_S = 3.0
+
+
 FORK_NAME = "ibasebcast"
 FORK_REPO = "https://github.com/ibasebcast/pyalarmdotcomajax"
 
@@ -185,9 +207,14 @@ class AlarmBridge:
         # (but not initialized) AlarmBridge to populate the adc cli command list.
 
         self._initialized = False
+        self.device_access = DeviceAccessManager(self)
 
         # Event Broker
         self.events = EventBroker()
+
+        # Debounced device re-fetch; see request_reconcile().
+        self._reconcile_task: asyncio.Task | None = None
+        self._reconcile_requested = False
 
         # Session
         self._websession: aiohttp.ClientSession | None = None
@@ -201,6 +228,10 @@ class AlarmBridge:
         # someone else while it waited, and skip its own login.
         self._login_lock = asyncio.Lock()
         self._login_generation = 0
+        # Outcome of the latest session repair, and when the next one may be attempted.
+        self._last_login_error: BaseException | None = None
+        self._login_retry_at = 0.0
+        self._login_backoff_s: float = LOGIN_BACKOFF_INITIAL_S
 
         # Session Controllers
         self._auth_controller = AuthenticationController(
@@ -294,7 +325,81 @@ class AlarmBridge:
     async def login(self) -> None:
         """Login to alarm.com."""
 
-        return await self._auth_controller.login()
+        token = _LOGIN_IN_PROGRESS.set(True)
+        try:
+            return await self._auth_controller.login()
+        finally:
+            _LOGIN_IN_PROGRESS.reset(token)
+
+    async def _repair_session(self, login_generation: int) -> None:
+        """
+        Log in again after the session expired, once for all concurrent callers.
+
+        login_generation is the generation the caller saw before its request went out. If any login attempt has
+        happened since, its outcome stands for this caller too: a success means retry the request, a failure means
+        fail without another attempt. A failed attempt also starts a backoff that later callers respect.
+
+        Raises:
+            OtpRequired / MustConfigureMfa: Alarm.com wants a one-time code; only reauthentication can fix it.
+            AuthenticationFailed: The credentials were rejected (or were, within the backoff).
+            ServiceUnavailable: Alarm.com could not be reached or answered unexpectedly.
+
+        """
+
+        async with self._login_lock:
+            if login_generation != self._login_generation:
+                if self._last_login_error is None:
+                    log.debug("Session already repaired by another task; retrying.")
+                    return
+                raise self._repeat_login_failure()
+
+            if time.monotonic() < self._login_retry_at:
+                raise self._repeat_login_failure()
+
+            log.info("Attempting to repair session.")
+            token = _LOGIN_IN_PROGRESS.set(True)
+            try:
+                async with asyncio.timeout(LOGIN_REPAIR_TIMEOUT_S):
+                    await self._auth_controller.login()
+            except (OtpRequired, MustConfigureMfa) as err:
+                self._record_login_failure(err)
+                raise
+            except AuthenticationException as err:
+                self._record_login_failure(err)
+                raise AuthenticationFailed("Session repair failed: the login was rejected.") from err
+            except (TimeoutError, aiohttp.ClientError, AlarmdotcomException) as err:
+                self._record_login_failure(err)
+                raise ServiceUnavailable("Session repair failed: Alarm.com could not complete the login.") from err
+            finally:
+                _LOGIN_IN_PROGRESS.reset(token)
+                self._login_generation += 1
+
+            self._last_login_error = None
+            self._login_retry_at = 0.0
+            self._login_backoff_s = LOGIN_BACKOFF_INITIAL_S
+
+    def _record_login_failure(self, err: BaseException) -> None:
+        """Remember a failed repair and start (or lengthen) the backoff before the next one."""
+
+        self._last_login_error = err
+        self._login_retry_at = time.monotonic() + self._login_backoff_s
+        log.warning(
+            "Alarm.com session repair failed (%s). Not logging in again for %s seconds.",
+            type(err).__name__,
+            round(self._login_backoff_s),
+        )
+        self._login_backoff_s = min(self._login_backoff_s * 2, LOGIN_BACKOFF_MAX_S)
+
+    def _repeat_login_failure(self) -> AlarmdotcomException:
+        """Build the error for a caller that arrives while the latest repair's failure still stands."""
+
+        err = self._last_login_error
+
+        if isinstance(err, (OtpRequired, MustConfigureMfa)):
+            return err
+        if isinstance(err, AuthenticationException):
+            return AuthenticationFailed("A recent session repair was rejected; waiting before trying again.")
+        return ServiceUnavailable("A recent session repair failed; waiting before trying again.")
 
     async def get_activity_history(
         self,
@@ -356,6 +461,15 @@ class AlarmBridge:
             if resource.type == ResourceType.HISTORY_EVENT.value
         ]
 
+    @staticmethod
+    def _build_light_discovery_path(light_ids: set[str]) -> str:
+        """Build an ID-scoped light request, including for a single device."""
+        if not light_ids:
+            raise ValueError("At least one light ID is required.")
+        return "devices/lights?" + urlencode(
+            [("ids[]", device_id) for device_id in sorted(light_ids)]
+        )
+
     async def fetch_full_state(self) -> None:
         """Fetch full state from alarm.com."""
 
@@ -403,6 +517,100 @@ class AlarmBridge:
         if init_tasks:
             await asyncio.gather(*init_tasks)
 
+        # Some providers reject an unscoped lights request with HTTP 423.
+        # The Alarm.com web portal instead requests lights with explicit ids[].
+        # Only use IDs actually advertised by the system/catalog; never guess IDs.
+        if not self._lights.items:
+            light_ids = set(device_ids_by_type.get(type(self._lights), []))
+            light_ids.update(self._lights._target_device_ids)  # noqa: SLF001
+            # Some accounts advertise light IDs in catalog relationships.
+            for catalog in self._device_catalogs.items:
+                for relationship in (catalog.api_resource.relationships or {}).values():
+                    light_ids.update(
+                        item.id for item in relationship.data_list
+                        if item.type == ResourceType.LIGHT
+                    )
+            light_ids.update(
+                item.id for item in self._device_catalogs._included_resources  # noqa: SLF001
+                if item.type == ResourceType.LIGHT
+            )
+            if not light_ids:
+                # Some system collection responses omit the lights relationship.
+                # Request the active system's detail endpoint explicitly, matching
+                # the Alarm.com web portal's light discovery sequence.
+                try:
+                    system_id = self._available_device_catalogs.active_system_id
+                    log.debug(
+                        "Light discovery: requesting active system detail for light IDs."
+                    )
+                    log.debug(
+                        "Light discovery probe: requested system is present in loaded systems: %s.",
+                        any(system.id == system_id for system in self._systems.items),
+                    )
+                    system_detail = await self.get(
+                        "systems/systems", system_id,
+                        light_discovery_system_id=system_id,
+                    )
+                    system_resources = (
+                        system_detail.data
+                        if isinstance(system_detail.data, list)
+                        else [system_detail.data]
+                    )
+                    relationship_keys: set[str] = set()
+                    light_entry_count = 0
+                    for system_resource in system_resources:
+                        relationships = system_resource.relationships or {}
+                        relationship_keys.update(relationships)
+                        lights_relationship = relationships.get("lights")
+                        if lights_relationship:
+                            entries = lights_relationship.data_list
+                            light_entry_count += len(entries)
+                            # The named lights relationship defines the device
+                            # category. Do not discard its advertised IDs just
+                            # because a provider uses a different type label.
+                            light_ids.update(
+                                item.id for item in entries
+                                if isinstance(item.id, str) and item.id.strip()
+                            )
+                    log.debug(
+                        "Light discovery: system detail returned %d light IDs; "
+                        "lights relationship present: %s; relationship count: %d; "
+                        "lights relationship entries: %d.",
+                        len(light_ids),
+                        "lights" in relationship_keys,
+                        len(relationship_keys),
+                        light_entry_count,
+                    )
+                except Exception as err:
+                    log.warning(
+                        "Light discovery: active system detail lookup failed (%s).",
+                        type(err).__name__,
+                    )
+            if light_ids:
+                try:
+                    # Use ids[] even for one light (not /lights/{id}).
+                    scoped_path = self._build_light_discovery_path(light_ids)
+                    light_response = await self.get(scoped_path, None)
+                    light_resources = (
+                        light_response.data
+                        if isinstance(light_response.data, list)
+                        else [light_response.data]
+                    )
+                    await self._lights._refresh(pre_fetched=light_resources)  # noqa: SLF001
+                    log.info("ID-scoped light discovery registered %d lights.", len(self._lights.items))
+                except Exception:
+                    log.exception("ID-scoped light discovery failed.")
+            else:
+                # Preserve unscoped discovery for accounts where it works.
+                # Some providers return HTTP 423, which is nonfatal.
+                try:
+                    response = await self.get(ResourceType.LIGHT, None)
+                    resources = response.data if isinstance(response.data, list) else [response.data]
+                    await self._lights._refresh(pre_fetched=resources)  # noqa: SLF001
+                    log.info("Unscoped light discovery registered %d lights.", len(self._lights.items))
+                except Exception:
+                    log.debug("Unscoped light discovery unavailable; no known light IDs for scoped retry.")
+
     async def refresh_all_resources(self) -> None:
         """
         Force a re-fetch and re-publish of state for every already-initialized resource controller.
@@ -426,9 +634,62 @@ class AlarmBridge:
             if controller.initialized
         ]
 
-        if refresh_tasks:
-            await asyncio.gather(*refresh_tasks, return_exceptions=True)
+        if not refresh_tasks:
+            return
 
+        results = await asyncio.gather(*refresh_tasks, return_exceptions=True)
+
+        # One controller failing must not stop the others, but an authentication failure has to reach the
+        # caller: it is how the hub learns that the session cannot be repaired and reauthentication is needed.
+        # NotAuthorized is not one. It is Alarm.com's 406/423 for an endpoint this account cannot use (a feature
+        # missing from the plan, a device type disabled), and the session is fine. Passing it up made the hub log in
+        # again every few minutes for as long as that endpoint kept refusing.
+        for result in results:
+            if isinstance(result, AuthenticationException) and not isinstance(result, NotAuthorized):
+                raise result
+            if isinstance(result, NotAuthorized):
+                log.debug("A controller refresh was refused by Alarm.com (not a login problem): %s", result)
+            elif isinstance(result, Exception):
+                log.debug("A controller refresh failed: %r", result)
+
+
+    def request_reconcile(self, reason: str, delay_s: float = RECONCILE_DELAY_S) -> None:
+        """
+        Re-fetch device state shortly, coalescing a burst of requests into one fetch.
+
+        WebSocket events are deltas with no replay, so any event that arrives while the socket is between
+        connections is lost, and an OpenedClosed event only implies that the sensor ended closed. Each of those
+        moments asks for a reconcile: one device-catalog request that carries every sensor, partition, lock,
+        etc., applied under BaseController's guard so it cannot undo an event that arrived after it was sent.
+        """
+
+        self._reconcile_requested = True
+
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            # The running task re-checks the flag after its fetch, so a request made while that fetch is in
+            # flight still gets a fetch that starts after it.
+            return
+
+        self._reconcile_task = asyncio.create_task(self._reconcile(reason, delay_s), name="Alarm.com reconcile")
+
+    async def _reconcile(self, reason: str, delay_s: float) -> None:
+        """Run requested reconciles until no new request arrived during the last fetch."""
+
+        while self._reconcile_requested:
+            await asyncio.sleep(delay_s)
+            self._reconcile_requested = False
+
+            if not self._initialized or not self._device_catalogs.initialized:
+                return
+
+            log.debug("Reconciling device state (%s).", reason)
+
+            try:
+                await self._device_catalogs._refresh()  # noqa: SLF001
+            except Exception:
+                # The periodic full refresh is the backstop; a failed reconcile must not take anything down.
+                log.debug("Reconcile failed (%s).", reason, exc_info=True)
+                return
 
     async def start_event_monitoring(
         self, ws_status_callback: EventBrokerCallbackT | None = None
@@ -650,6 +911,10 @@ class AlarmBridge:
 
         self._ws_controller.stop()
 
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+        self._reconcile_task = None
+
         if self._websession:
             await self._websession.close()
         self._websession = None
@@ -771,37 +1036,10 @@ class AlarmBridge:
                 log.debug("Got new token from MFA cookie.")
                 self._auth_controller.mfa_cookie = new_mfa_cookie
 
-            # If DEBUG logging is enabled, log the request and response.
-            if log.isEnabledFor(logging.DEBUG):
-                try:
-                    resp_dump = (
-                        json.dumps(await resp.json()) if resp.content_length else ""
-                    )
-                except (json.JSONDecodeError, aiohttp.ContentTypeError):
-                    if resp.content_type == "text/html":
-                        resp_dump = "***OMITTING HTML OUTPUT***"
-                    else:
-                        resp_dump = await resp.text() if resp.content_length else ""
-
-                log.debug(
-                    "\n===========================Server Request (%s) / Response (%s)===========================\n"
-                    "URL: %s\n"
-                    "REQUEST HEADERS:\n%s\n"
-                    "REQUEST BODY:\n%s\n"
-                    "RESPONSE HEADERS:\n%s\n"
-                    "RESPONSE BODY:\n%s\n"
-                    "URL: %s\n"
-                    "=================================================================================\n",
-                    resp.request_info.method,
-                    resp.status,
-                    url,
-                    json.dumps(dict(resp.request_info.headers)),
-                    kwargs.get("data") or kwargs.get("json"),
-                    json.dumps(dict(resp.headers)),
-                    resp_dump[:DEBUG_REQUEST_DUMP_MAX_LEN]
-                    + "..." * (len(resp_dump) > DEBUG_REQUEST_DUMP_MAX_LEN),
-                    url,
-                )
+            # Never log HTTP headers, bodies, cookies, OTPs, or response tokens.
+            # Even DEBUG logs are routinely attached to public issue reports.
+            log.debug("Alarm.com HTTP %s completed with status %s",
+                      resp.request_info.method, resp.status)
 
             yield resp
 
@@ -854,6 +1092,7 @@ class AlarmBridge:
         success_response_class: type[T] | type[SuccessDocument] = SuccessDocument,
         *,
         allow_login_repair: bool = True,
+        light_discovery_system_id: str | None = None,
         **kwargs: Any,
     ) -> T | SuccessDocument:
         """Make request to the api and return response data."""
@@ -868,10 +1107,8 @@ class AlarmBridge:
         login_generation = self._login_generation
 
         log.info(
-            "Requesting %s %s with %s expecting %s as %s",
+            "Requesting %s expecting %s as %s",
             method.upper(),
-            url,
-            kwargs.get("data") or kwargs.get("json"),
             accept_types,
             success_response_class.__name__,
         )
@@ -880,6 +1117,11 @@ class AlarmBridge:
             async with self.create_request(
                 method, url, accept_types, use_ajax_key=True, **kwargs
             ) as raw_resp:
+                # Color PUTs can confirm with 204 and no document. Errors still
+                # follow the normal status/schema checks and session-repair path.
+                if method.lower() == "put" and raw_resp.status == 204:
+                    return success_response_class.from_dict({"data": None})
+
                 # Load the response as JSON:API object.
 
                 response: FailureDocument | JsonApiBaseElement | MetaDocument | None = (
@@ -887,25 +1129,35 @@ class AlarmBridge:
                 )
 
                 try:
-                    response = success_response_class.from_json(await raw_resp.text())
-                except json.JSONDecodeError as err:
+                    response_text = await raw_resp.text()
+                    response = success_response_class.from_json(response_text)
+                except json.JSONDecodeError:
                     # Triggered when the response is not valid JSON.
-                    raise UnexpectedResponse("Response was not valid JSON.") from err
+                    raise UnexpectedResponse("Response was not valid JSON.") from None
                 except (ValueError, MissingField):
                     # Triggered when discriminator resolution fails or if field is missing in response.
                     pass
 
                 if isinstance(response, success_response_class):
+                    if light_discovery_system_id is not None and log.isEnabledFor(logging.DEBUG):
+                        try:
+                            summary = summarize_light_discovery(
+                                json.loads(response_text), response.data, light_discovery_system_id,
+                            )
+                            log.debug("Light discovery probe: %s", summary)
+                        except Exception as probe_error:
+                            # A diagnostic must never break discovery or log a payload-bearing exception.
+                            log.debug("Light discovery probe unavailable (%s).", type(probe_error).__name__)
                     return response
 
                 # JsonAPI and AdcMini failure responses evaluate to the standard JSON:API FailureDocument.
                 try:
                     response = FailureDocument.from_json(await raw_resp.text())
-                except (ValueError, MissingField) as err:
-                    log.exception("Failed to parse response as FailureDocument.")
+                except (ValueError, MissingField):
+                    log.warning("Failed to parse response as FailureDocument.")
                     raise UnexpectedResponse(
                         "Response did not match requested schema definition."
-                    ) from err
+                    ) from None
 
                 # "Successful" FailureDocument requests always return a 200 response code. Non-200 responses
                 # indicate server failure.
@@ -930,35 +1182,35 @@ class AlarmBridge:
                             "device type disabled for this system."
                         )
                         raise NotAuthorized(
-                            f"Method: {method}\nURL: {url}\nStatus Codes: "
-                            f"{error_codes}\nRequest Body: {kwargs.get('data')}"
+                            f"Method: {method}\nStatus Codes: "
+                            f"{error_codes}"
                         )
 
                     # 401: Logged Out, 403: Invalid Anti Forgery
                     if any(x in [401, 403] for x in error_codes):
                         raise AuthenticationFailed(
-                            f"Method: {method}\nURL: {url}\nStatus Codes: "
-                            f"{error_codes}\nRequest Body: {kwargs.get('data')}",
+                            f"Method: {method}\nStatus Codes: "
+                            f"{error_codes}",
                             can_autocorrect=True,
                         )
 
                     # 409: Two Factor Authentication Required
                     if 409 in error_codes:
                         raise AuthenticationFailed(
-                            f"Two factor authentication required.\nMethod: {method}\nURL: {url}\nStatus Codes: "
-                            f"{error_codes}\nRequest Body: {kwargs.get('data')}"
+                            f"Two factor authentication required.\nMethod: {method}\nStatus Codes: "
+                            f"{error_codes}"
                         )
 
                     # 422: Wrong Two Factor Authentication Code
                     if 422 in error_codes:
                         raise AuthenticationFailed(
-                            f"Method: {method}\nURL: {url}\nStatus Codes: "
-                            f"{error_codes}\nRequest Body: {kwargs.get('data')}"
+                            f"Method: {method}\nStatus Codes: "
+                            f"{error_codes}"
                         )
 
                     raise UnexpectedResponse(
-                        f"Method: {method}\nURL: {url}\nStatus Codes: "
-                        f"{error_codes}\nRequest Body: {kwargs.get('data')}"
+                        f"Method: {method}\nStatus Codes: "
+                        f"{error_codes}"
                     )
 
                 raw_resp.raise_for_status()
@@ -967,30 +1219,22 @@ class AlarmBridge:
                 raise UnexpectedResponse
 
         except AuthenticationFailed as err:
-            if err.can_autocorrect and allow_login_repair:
-                try:
-                    async with self._login_lock:
-                        # Another task may have already repaired the session while we waited
-                        # on the lock. Only log in if nobody else has done so since we started.
-                        if login_generation == self._login_generation:
-                            log.info("Attempting to repair session.")
-                            await self._auth_controller.login()
-                            self._login_generation += 1
-                        else:
-                            log.debug(
-                                "Session already repaired by another task; retrying."
-                            )
-                    return await self.request(
-                        method,
-                        url,
-                        success_response_class=success_response_class,
-                        allow_login_repair=False,
-                        **kwargs,
-                    )
-                except Exception as err:
-                    raise AuthenticationFailed from err
+            if not (err.can_autocorrect and allow_login_repair) or _LOGIN_IN_PROGRESS.get():
+                raise
 
-            raise
+            await self._repair_session(login_generation)
+
+        # Outside the except block, so an error on the retry keeps its own type instead of being reported as an
+        # authentication failure, and the retry asks for the same response type as the original request.
+        return await self.request(
+            method,
+            url,
+            accept_types,
+            success_response_class=success_response_class,
+            allow_login_repair=False,
+            light_discovery_system_id=light_discovery_system_id,
+            **kwargs,
+        )
 
     def _generate_request_url(
         self, path: ResourceType | str, id: str | set[str] | None
@@ -1104,7 +1348,7 @@ class AlarmBridge:
                     **kwargs,
                 )
 
-            except (TimeoutError, aiohttp.ClientResponseError) as e:
+            except (TimeoutError, aiohttp.ClientResponseError, aiohttp.ClientConnectionError) as e:
                 if retries == REQUEST_RETRY_LIMIT:
                     raise ServiceUnavailable from e
                 retries += 1

@@ -118,7 +118,7 @@ class ThermostatAttributes(TemperatureDeviceAttributes[ThermostatState]):
     desired_heat_setpoint: float = field(metadata={"description": "The desired heat setpoint."})
     fan_duration: int | None = field(metadata={"description": "The duration to run the fan. Only used to offset the commands."}, default=None)
     fan_mode: ThermostatReportedFanMode | None = field(default=None, metadata={"description": "The current fan mode."})
-    forwarding_ambient_temp: float = field(metadata={"description": "The current temperature including any additional temperature sensor averaging."})
+    forwarding_ambient_temp: float | None = field(metadata={"description": "The current temperature including any additional temperature sensor averaging."}, default=None)
     has_pending_setpoint_change: bool = field(metadata={"description": "Indicates if there is a pending setpoint change."})
     has_pending_temp_mode_change: bool = field(metadata={"description": "Indicates if there is a pending temperature mode change."})
     heat_setpoint: float = field(metadata={"description": "The current heat setpoint."})
@@ -174,7 +174,11 @@ class Thermostat(AdcDeviceResource[ThermostatAttributes]):
     def fan_mode(self) -> ThermostatFanMode:
         """The current fan mode."""
 
-        current_fan_mode = self.attributes.desired_fan_mode or self.attributes.fan_mode
+        current_fan_mode = (
+            self.attributes.desired_fan_mode
+            if self.attributes.desired_fan_mode is not None
+            else self.attributes.fan_mode
+        )
 
         if current_fan_mode in (
             ThermostatReportedFanMode.AUTO_LOW,

@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import timedelta
+from time import monotonic
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -13,6 +14,7 @@ from homeassistant.core import CALLBACK_TYPE, HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
+from yarl import URL
 
 from .const import (
     CONF_CAMERA_TOKEN_REFRESH_INTERVAL,
@@ -38,9 +40,7 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Alarm.com cameras from a config entry."""
-    camera_session: AlarmCameraSession | None = hass.data[DOMAIN][entry.entry_id].get(
-        "camera_session"
-    )
+    camera_session: AlarmCameraSession | None = entry.runtime_data.camera_session
 
     if camera_session is None:
         _LOGGER.debug(
@@ -122,6 +122,7 @@ class AlarmDotComCamera(Camera):
         self._attr_unique_id = f"{entry_id}_camera_{self._id}"
         self._attr_name = self._name
         self._webrtc_config: dict | None = None
+        self._last_empty_stream_warning: float | None = None
         self._remove_refresh: CALLBACK_TYPE | None = None
 
         self._attr_device_info = DeviceInfo(
@@ -137,6 +138,7 @@ class AlarmDotComCamera(Camera):
     async def async_added_to_hass(self) -> None:
         """Start periodic token refresh when entity is added."""
         await super().async_added_to_hass()
+        self.hass.data.setdefault(DOMAIN + '_camera_entities', {})[self.entity_id] = self
 
         await self._fetch_stream_info()
 
@@ -148,6 +150,7 @@ class AlarmDotComCamera(Camera):
 
     async def async_will_remove_from_hass(self) -> None:
         """Cancel periodic refresh when entity is removed."""
+        self.hass.data.get(DOMAIN + '_camera_entities', {}).pop(self.entity_id, None)
         if self._remove_refresh is not None:
             self._remove_refresh()
             self._remove_refresh = None
@@ -161,9 +164,12 @@ class AlarmDotComCamera(Camera):
         """Fetch stream info from Alarm.com with one auth retry."""
         if self._fetch_lock.locked():
             _LOGGER.debug(
-                "Token fetch already in progress for camera %s, skipping.",
+                "Waiting for token fetch already in progress for camera %s.",
                 self._id,
             )
+            # Share the in-flight result rather than returning stale credentials.
+            async with self._fetch_lock:
+                pass
             return
 
         async with self._fetch_lock:
@@ -228,14 +234,19 @@ class AlarmDotComCamera(Camera):
                 self.async_write_ha_state()
                 return
 
-        if not config:
-            _LOGGER.warning("Empty stream info returned for camera %s", self._id)
-            self._webrtc_config = None
-        else:
-            self._webrtc_config = config
-            _LOGGER.debug("WebRTC tokens refreshed for camera %s", self._id)
+            if not config:
+                now = monotonic()
+                if (self._last_empty_stream_warning is None
+                        or now - self._last_empty_stream_warning >= 1800):
+                    _LOGGER.warning("Empty stream info returned for camera %s", self._id)
+                    self._last_empty_stream_warning = now
+                self._webrtc_config = None
+            else:
+                self._webrtc_config = config
+                self._last_empty_stream_warning = None
+                _LOGGER.debug("WebRTC tokens refreshed for camera %s", self._id)
 
-        self.async_write_ha_state()
+            self.async_write_ha_state()
 
     @property
     def is_on(self) -> bool:
@@ -244,15 +255,26 @@ class AlarmDotComCamera(Camera):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return state attributes including the WebRTC config."""
-        return {"webrtc_config": self._webrtc_config}
+        """Never expose ephemeral stream credentials in HA state or recorder."""
+        return {}
+
+    async def async_get_webrtc_config(self) -> dict | None:
+        """
+        Fetch current credentials for a new authorized browser session.
+
+        Cached credentials may have expired or been consumed by a previous
+        stream. Dashboard reconnects must not depend on the periodic refresh.
+        Concurrent callers share a fetch already in progress for this camera.
+        """
+        await self._fetch_stream_info()
+        return self._webrtc_config
 
     async def stream_source(self) -> str | None:
         """
         Return a native HA stream source.
 
-        Alarm.com cameras in this integration use WebRTC config delivered
-        through entity attributes, not a native HLS or RTSP stream URL.
+        Alarm.com cameras use WebRTC configuration retrieved via an
+        authenticated websocket command, not a native HLS or RTSP URL.
         Returning None prevents Home Assistant from treating the config dict
         like a native stream object.
         """
@@ -272,20 +294,37 @@ class AlarmDotComCamera(Camera):
     ) -> bytes | None:
         """Return a still snapshot image from the camera."""
         try:
-            resp = await self._session.get(
-                f"https://www.alarm.com/web/api/video/devices/cameras/{self._id}/snapshot"
-            )
-            return await resp.read()
+            signed_url = await self._session.get_snapshot_url(self._id)
+            if not signed_url:
+                return None
+            url = URL(signed_url)
+            if url.scheme != "https" or not url.host or url.user is not None:
+                return None
+
+            # The signed URL belongs to a video host, not the authenticated API.
+            # A separate cookie-free client prevents session cookies, MFA tokens,
+            # and AJAX headers from being forwarded with the image request.
+            async with aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar(),
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as image_session, image_session.get(url, allow_redirects=False) as response:
+                response.raise_for_status()
+                if response.status != 200 or not response.content_type.startswith("image/"):
+                    return None
+                # Bound the download and do not return HTML/JSON error pages
+                # as a successful camera snapshot.
+                chunks: list[bytes] = []
+                size = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    size += len(chunk)
+                    if size > 10 * 1024 * 1024:
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks) or None
         except aiohttp.ClientResponseError as err:
-            if err.status == 404:
-                _LOGGER.debug("Camera %s does not support snapshots (404).", self._id)
-            else:
-                _LOGGER.debug(
-                    "Snapshot fetch failed for camera %s: HTTP %s",
-                    self._id,
-                    err.status,
-                )
+            _LOGGER.debug("Snapshot request failed with HTTP %s", err.status)
         except Exception as err:
-            _LOGGER.debug("Snapshot fetch error for camera %s: %s", self._id, err)
+            # Exceptions can contain signed URLs. Log only the exception type.
+            _LOGGER.debug("Snapshot request failed (%s)", type(err).__name__)
 
         return None

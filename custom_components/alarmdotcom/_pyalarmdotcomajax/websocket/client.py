@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Literal, NoReturn
 
 import aiohttp
 from _pyalarmdotcomajax.const import API_URL_BASE
-from _pyalarmdotcomajax.events import EventBrokerMessage, EventBrokerTopic
+from _pyalarmdotcomajax.events import DeviceActivityMessage, EventBrokerMessage, EventBrokerTopic
 from _pyalarmdotcomajax.exceptions import (
     AuthenticationFailed,
     NotInitialized,
@@ -42,7 +42,9 @@ ALL_TOKEN_T = Literal["*"]
 
 
 KEEP_ALIVE_SIGNAL_INTERVAL_S = 60
-MAX_RECONNECT_WAIT_S = 30 * 60
+# The reader never gives up (see _event_reader); this caps how long it waits between attempts, so service resumes
+# within minutes of Alarm.com or the internet coming back.
+MAX_RECONNECT_WAIT_S = 5 * 60
 
 # Alarm.com's websocket token is short-lived: the server closes the connection
 # with code 1008 ("rejected token") about five minutes after it is issued.
@@ -57,14 +59,13 @@ MAX_RECONNECT_WAIT_S = 30 * 60
 # So replace the connection before the server expires it, on our own schedule
 # and with a fresh token, rather than waiting to be kicked off.
 WS_TOKEN_LIFETIME_S = 4 * 60 + 30
-
-# How long to wait for the websocket handshake before giving up on it.
-# Connections to webskt.alarm.com sometimes hang instead of failing: measured
-# on a live system, a stalled attempt took 30.4 seconds to raise, and it
-# happens to planned replacements too, not just reconnects after a kick. With
-# no timeout of our own that is 30 seconds of lost events for a connection we
-# could have retried in two. A successful handshake there takes ~150ms.
 WS_CONNECT_TIMEOUT_S = 10
+
+# How long to wait for a websocket token. The request goes to www.alarm.com, whose aiohttp defaults would allow
+# minutes per attempt, and during a planned replacement the old connection is already closed - every event in
+# that time is lost while the client still reports CONNECTED. Timing out instead takes the reconnect path, which
+# ends in RECONNECTED and a full refresh.
+WS_TOKEN_FETCH_TIMEOUT_S = 15
 
 # How many raw frames to keep for diagnostics. The old cap of 25 was useless on
 # any real account: a household with three phones reporting geofence crossings
@@ -75,7 +76,6 @@ WS_CONNECT_TIMEOUT_S = 10
 # same chatty rate, something like twenty minutes of history.
 EVENT_HISTORY_MAXLEN = 500
 DEFAULT_SIGNALS_PER_SESSION_REFRESH = 1
-MAX_CONNECTION_ATTEMPTS = 25
 
 
 log = logging.getLogger(__name__)
@@ -238,67 +238,46 @@ class WebSocketClient:
             connect_attempts += 1
 
             try:
-                await self._authenticate()
-
-                # The clock starts here, not after the handshake: the server
-                # dates the token from when it issued it, so a slow connect
-                # eats into the lifetime rather than extending it.
-                token_issued_at = time.monotonic()
+                async with asyncio.timeout(WS_TOKEN_FETCH_TIMEOUT_S):
+                    await self._authenticate()
 
                 log.info("[EVENT READER] Connecting to Alarm.com WebSocket endpoint...")
 
-                token_expired = False
-
+                # The token's lifetime starts when it is issued, not when
+                # the WebSocket handshake completes.
+                token_issued_at = time.monotonic()
+                planned_refresh = False
                 async with contextlib.AsyncExitStack() as connection:
-                    # Only the handshake is under this timeout - wrapping the
-                    # whole block would cap the connection's lifetime instead.
                     async with asyncio.timeout(WS_CONNECT_TIMEOUT_S):
                         websocket = await connection.enter_async_context(
                             self._bridge.ws_connect(
                                 f"{self._ws_endpoint}/?f=1&auth={self._token}"
                             )
                         )
-
                     self._set_state(
                         WebSocketState.CONNECTED if connect_attempts == 1 else WebSocketState.RECONNECTED,
                     )
+
+                    if connect_attempts == 1:
+                        # A first connection or a planned replacement. Neither emits RECONNECTED, so no
+                        # controller refreshes, yet events were lost in both gaps: between the initial state
+                        # fetch and this connection, and while the old connection closed and this one opened.
+                        # (RECONNECTED already triggers a full refresh in every controller.)
+                        self._bridge.request_reconcile("websocket connected")
+
                     connect_attempts = 1
-
                     log.info("[EVENT READER] Connected to WebSocket")
-
-                    # Leaving this block for any reason closes the connection,
-                    # so the deadline is what ends the session - deliberately,
-                    # before the server would.
-                    remaining = WS_TOKEN_LIFETIME_S - (
-                        time.monotonic() - token_issued_at
-                    )
-
+                    remaining = max(0, WS_TOKEN_LIFETIME_S - (time.monotonic() - token_issued_at))
                     try:
-                        async with asyncio.timeout(max(remaining, 0)) as deadline:
+                        async with asyncio.timeout(remaining) as deadline:
                             await self._read_messages(websocket)
                     except TimeoutError:
-                        # Only ours counts as planned. A TimeoutError raised by
-                        # the read itself is a real failure and has to keep the
-                        # backoff, or a socket that times out on every read
-                        # becomes a tight reconnect loop hammering the token
-                        # endpoint.
                         if not deadline.expired():
                             raise
+                        planned_refresh = True
+                        log.debug("[EVENT READER] Rotating WebSocket before token expiry.")
 
-                        token_expired = True
-                        log.debug(
-                            "[EVENT READER] Replacing the connection before its token expires."
-                        )
-
-                if token_expired:
-                    # A planned replacement, not a failure: reconnect at once,
-                    # with no backoff and no attempt counted against the limit.
-                    # Zero rather than leave it at one, because the loop counts
-                    # the coming attempt as it starts - leaving it would make
-                    # the fresh connection report RECONNECTED, and every
-                    # controller would run a full reconnect refresh on our own
-                    # timer. Downstream sees no interruption, because as far as
-                    # it is concerned there wasn't one.
+                if planned_refresh:
                     connect_attempts = 0
                     continue
 
@@ -306,10 +285,7 @@ class WebSocketClient:
                     close_code: aiohttp.WSCloseCode | int | None = websocket.close_code
                     with contextlib.suppress(AttributeError):
                         if websocket.close_code:
-                            # 1008 here means the server rejected our token - the
-                            # expiry that WS_TOKEN_LIFETIME_S now preempts. Seeing
-                            # it again means the server's lifetime got shorter than
-                            # ours, and that constant should come down.
+                            # Code 1008 indicates token rejection; proactive rotation should preempt it.
                             close_code = aiohttp.WSCloseCode(int(websocket.close_code))
 
                     log.debug("[EVENT READER] WebSocket Connection Closed (%s)", close_code)
@@ -343,17 +319,17 @@ class WebSocketClient:
                 log.exception("[EVENT READER] Fatal Error")
                 raise err  # noqa: TRY201
 
-            if connect_attempts >= MAX_CONNECTION_ATTEMPTS:
-                self.stop()
+            # No attempt limit. Stopping here used to end the reader for good after 25 failures (about half an
+            # hour of an Alarm.com or internet outage) while emitting DISCONNECTED rather than DEAD, so nothing
+            # restarted it and Home Assistant kept reporting the integration available with no live updates.
 
             reconnect_wait = round(
                 min(10 * connect_attempts * random.random(), MAX_RECONNECT_WAIT_S)  # noqa: S311
             )
 
             log.debug(
-                "[EVENT READER] WebSocket Disconnected - Reconnect attempt %s of %s will be attempted in %s seconds.",
+                "[EVENT READER] WebSocket Disconnected - Reconnect attempt %s will be attempted in %s seconds.",
                 connect_attempts,
-                MAX_CONNECTION_ATTEMPTS,
                 reconnect_wait,
             )
 
@@ -371,30 +347,48 @@ class WebSocketClient:
             await asyncio.sleep(reconnect_wait)
 
     async def _read_messages(self, websocket: aiohttp.ClientWebSocketResponse) -> None:
-        """Queue incoming frames until the connection closes or the caller stops us."""
-
+        """Read and retain WebSocket events until disconnected or rotated."""
         async for msg in websocket:
             if msg.type == aiohttp.WSMsgType.CLOSED:
                 log.info(
-                    "[EVENT READER]aiohttp WebSocket connection closed: Code: %s, Message: '%s'",
-                    msg.data,
-                    msg.extra,
+                    "[EVENT READER] WebSocket closed: Code: %s, Message: '%s'",
+                    msg.data, msg.extra,
                 )
                 continue
-
             if msg.type == aiohttp.WSMsgType.ERROR:
-                log.info("[EVENT READER]aiohttp WebSocket error: '%s'", msg.data)
+                log.info("[EVENT READER] WebSocket error: '%s'", msg.data)
                 continue
-
             if msg.type != aiohttp.WSMsgType.TEXT:
-                log.debug(
-                    "[EVENT READER]Got non-text WebSocket message: '%s'",
-                    msg.data,
-                )
+                log.debug("[EVENT READER] Non-text WebSocket message: '%s'", msg.data)
                 continue
-
             self._event_queue.put_nowait(msg.data)
             self._event_history.append(msg.data)
+
+    def _emit_device_activity(self, payload: object) -> bool:
+        """Decode confirmed scene and video events from either ADC field casing."""
+        if not isinstance(payload, dict):
+            return False
+        fields = {str(key).replace("_", "").lower(): value for key, value in payload.items()}
+        try:
+            event_type = int(fields.get("eventtype", -1))
+        except (TypeError, ValueError):
+            return False
+        if event_type not in (163, 71, 210):
+            return False
+        unit = fields.get("unitid")
+        device = fields.get("deviceid")
+        if unit is None or device is None:
+            return False
+        resource_id = str(device) if "-" in str(device) else f"{unit}-{device}"
+        try:
+            value = float(fields["eventvalue"]) if fields.get("eventvalue") is not None else None
+        except (TypeError, ValueError):
+            value = None
+        self._bridge.events.publish(DeviceActivityMessage(
+            id=resource_id, event_type=event_type, value=value,
+            extra=str(fields.get("qstringforextradata") or ""),
+        ))
+        return True
 
     async def _event_processor(self) -> NoReturn:
         """Process incoming events."""
@@ -403,6 +397,8 @@ class WebSocketClient:
             try:
                 msg_json: str = str(await self._event_queue.get())
 
+                if self._emit_device_activity(json.loads(msg_json)):
+                    continue
                 msg_tester = WebSocketMessageTester.from_json(msg_json)
 
                 # log.debug("Tester message: %s", msg_tester)
@@ -453,8 +449,10 @@ class WebSocketClient:
                     )
 
             except Exception:
-                log.exception("[EVENT PROCESSOR] Failed to convert message.\n")
-                log.debug(json.loads(msg_json))
+                # Never parse the malformed payload again in this error handler:
+                # doing so can kill the processor and freeze subsequent sensor updates.
+                log.exception("[EVENT PROCESSOR] Failed to convert message.")
+                log.debug("[EVENT PROCESSOR] Rejected payload: %s", msg_json)
 
     async def _keep_alive(self) -> NoReturn:
         """
@@ -482,7 +480,15 @@ class WebSocketClient:
             await asyncio.sleep(KEEP_ALIVE_SIGNAL_INTERVAL_S)
 
             # Don't send requests if websocket client is disconnected.
-            if self.state != WebSocketState.CONNECTED:
+            #
+            # `connected`, not `state == CONNECTED`: the event reader reports
+            # CONNECTED only for the very first connection and RECONNECTED for
+            # every one after that, and never returns to CONNECTED (see
+            # _event_reader). Comparing against CONNECTED alone therefore
+            # silenced the keep-alive permanently from the first reconnect
+            # onward, leaving the Alarm.com session to idle out and every later
+            # request to depend on the bridge's login-repair path.
+            if not self.connected:
                 log.debug("[KEEP ALIVE] Skipping keep alive.")
                 signals_sent = 0
                 continue

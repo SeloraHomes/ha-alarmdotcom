@@ -2,6 +2,7 @@
 
 import os
 import sys
+from pathlib import Path
 
 # pyalarmdotcomajax is vendored directly in this directory, as the
 # _pyalarmdotcomajax package (custom_components/alarmdotcom/_pyalarmdotcomajax/),
@@ -26,15 +27,16 @@ import sys
 # relative imports.
 _VENDOR_PATH = os.path.dirname(__file__)
 if _VENDOR_PATH not in sys.path:
-    sys.path.insert(0, _VENDOR_PATH)
+    sys.path.append(_VENDOR_PATH)
 
 import logging
+from dataclasses import dataclass
 from datetime import timedelta
 
 import _pyalarmdotcomajax as pyadc
 import aiohttp
-import voluptuous as vol
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.components.http import StaticPathConfig
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import ATTR_ENTITY_ID, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import Event, HomeAssistant, ServiceCall
 from homeassistant.exceptions import (
@@ -46,6 +48,11 @@ from homeassistant.exceptions import (
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 
+from .access_service import (
+    SERVICE_GET_TEMPORARY_USER_SCHEDULE,
+    SERVICE_SET_TEMPORARY_ACCESS,
+    async_register_access_service,
+)
 from .activity_history import ActivityFeedTracker
 from .auto_off import AutoOffManager
 from .camera_api import AlarmCameraSession
@@ -60,9 +67,6 @@ from .const import (
     CONF_MFA_TOKEN,
     CONF_NO_ENTRY_DELAY,
     CONF_SILENT_ARM,
-    DATA_ACTIVITY_FEED,
-    DATA_AUTO_OFF,
-    DATA_HUB,
     DEBUG_REQ_EVENT,
     DOMAIN,
     PLATFORMS,
@@ -73,8 +77,21 @@ from .const import (
     STARTUP_MESSAGE,
 )
 from .hub import AlarmHub
+from .schema import vol
+from .util import cleanup_orphaned_devices
+from .webrtc_ws import async_register as async_register_webrtc
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class AlarmEntryData:
+    """Runtime data stored on config_entry.runtime_data for this integration."""
+
+    hub: AlarmHub
+    auto_off_manager: AutoOffManager
+    camera_session: AlarmCameraSession | None
+    activity_feed_tracker: ActivityFeedTracker
 
 
 def _log_pyadc_location() -> None:
@@ -107,6 +124,29 @@ def _log_pyadc_location() -> None:
 async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Set up alarmdotcom hub from a config entry."""
 
+    async_register_webrtc(hass)
+    if hass.http is not None and not hass.data.get(DOMAIN + "_card_static_registered"):
+        await hass.http.async_register_static_paths([
+            StaticPathConfig(
+                "/alarmdotcom/alarm-webrtc-card.js",
+                str(Path(__file__).parent / "www" / "alarm-webrtc-card.js"),
+                cache_headers=True,
+            )
+        ])
+        hass.data[DOMAIN + "_card_static_registered"] = True
+        # Storage-mode dashboards can register the card automatically. YAML
+        # dashboards manage resources in YAML and are left untouched.
+        try:
+            lovelace = hass.data.get("lovelace")
+            resources = getattr(lovelace, "resources", None)
+            if resources is not None and hasattr(resources, "async_load"):
+                await resources.async_load()
+                url = "/alarmdotcom/alarm-webrtc-card.js"
+                existing = resources.async_items()
+                if not any(item.get("url", "").split("?")[0] == url for item in existing):
+                    await resources.async_create_item({"url": url, "res_type": "module"})
+        except Exception as err:
+            LOGGER.debug("Automatic camera card resource registration unavailable: %s", err)
     LOGGER.info("%s: Initializing Alarmdotcom from config entry.", __name__)
     LOGGER.info(STARTUP_MESSAGE)
     _log_pyadc_location()
@@ -120,24 +160,16 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
     except (TimeoutError, pyadc.AlarmdotcomException, aiohttp.ClientError) as ex:
         raise ConfigEntryNotReady from ex
 
-    if DOMAIN not in hass.data:
-        hass.data[DOMAIN] = {}
-    if config_entry.entry_id not in hass.data[DOMAIN]:
-        hass.data[DOMAIN][config_entry.entry_id] = {}
-
-    hass.data[DOMAIN][config_entry.entry_id][DATA_HUB] = hub
-
     auto_off_manager = AutoOffManager(hass, config_entry.entry_id)
     await auto_off_manager.async_load()
-    hass.data[DOMAIN][config_entry.entry_id][DATA_AUTO_OFF] = auto_off_manager
 
     activity_feed_tracker = ActivityFeedTracker(hub)
     activity_feed_tracker.async_start()
-    hass.data[DOMAIN][config_entry.entry_id][DATA_ACTIVITY_FEED] = activity_feed_tracker
 
     # Initialize WebRTC camera session, best effort.
     # Prefer reusing the already-authenticated pyalarmdotcomajax session to
     # avoid a second login. Falls back to an independent login automatically.
+    camera_session: AlarmCameraSession | None
     try:
         camera_session = AlarmCameraSession.from_alarm_bridge(
             bridge=hub.api,
@@ -155,17 +187,23 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             LOGGER.debug(
                 "Camera session: reusing pyalarmdotcomajax session, no second login needed."
             )
-
-        hass.data[DOMAIN][config_entry.entry_id]["camera_session"] = camera_session
     except Exception as err:
         LOGGER.warning(
             "Alarm.com camera session could not be initialized: %s. "
             "Camera entities will be unavailable.",
             err,
         )
-        hass.data[DOMAIN][config_entry.entry_id]["camera_session"] = None
+        camera_session = None
+
+    config_entry.runtime_data = AlarmEntryData(
+        hub=hub,
+        auto_off_manager=auto_off_manager,
+        camera_session=camera_session,
+        activity_feed_tracker=activity_feed_tracker,
+    )
 
     await hass.config_entries.async_forward_entry_setups(config_entry, PLATFORMS)
+    cleanup_orphaned_devices(hass, config_entry, set(hub.api.managed_devices))
 
     async def handle_alarmdotcom_debug_request_event(event: Event) -> None:
         """Dump debug data when requested via Home Assistant event."""
@@ -179,14 +217,16 @@ async def async_setup_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> b
             )
             return
 
+        # Resource JSON can contain account details and authentication fields.
+        # Never dump it into Home Assistant logs, even on a debug request.
         LOGGER.warning(
-            "ALARM.COM DEBUG DATA FOR %s: %s",
+            "ALARM.COM DEBUG DATA FOR %s: resource present (payload omitted for security)",
             str(event_resource.attributes.description).upper(),
-            event_resource.api_resource.to_json(),
         )
 
     hass.bus.async_listen(DEBUG_REQ_EVENT, handle_alarmdotcom_debug_request_event)
 
+    async_register_access_service(hass)
     _async_register_services(hass, config_entry, hub, auto_off_manager)
 
     LOGGER.info("%s: Finished initializing Alarmdotcom from config entry.", __name__)
@@ -438,32 +478,33 @@ async def async_migrate_entry(hass: HomeAssistant, config_entry: ConfigEntry) ->
 async def async_unload_entry(hass: HomeAssistant, config_entry: ConfigEntry) -> bool:
     """Unload a config entry."""
 
-    entry_data = hass.data[DOMAIN].pop(config_entry.entry_id)
-    hub: AlarmHub = entry_data[DATA_HUB]
-    camera_session: AlarmCameraSession | None = entry_data.get("camera_session")
-    auto_off_manager: AutoOffManager | None = entry_data.get(DATA_AUTO_OFF)
-    activity_feed_tracker: ActivityFeedTracker | None = entry_data.get(DATA_ACTIVITY_FEED)
+    entry_data: AlarmEntryData = config_entry.runtime_data
+    hub = entry_data.hub
+    camera_session = entry_data.camera_session
+    auto_off_manager = entry_data.auto_off_manager
+    activity_feed_tracker = entry_data.activity_feed_tracker
 
     if camera_session is not None:
         await camera_session.close()
 
-    if auto_off_manager is not None:
-        await auto_off_manager.async_unload()
-
-    if activity_feed_tracker is not None:
-        activity_feed_tracker.async_stop()
-
+    await auto_off_manager.async_unload()
+    activity_feed_tracker.async_stop()
     unload_success = await hub.close()
 
-    if len(hass.data[DOMAIN]) == 0:
-        hass.data.pop(DOMAIN)
-        if hass.services.has_service(DOMAIN, SERVICE_BYPASS_SENSOR):
-            hass.services.async_remove(DOMAIN, SERVICE_BYPASS_SENSOR)
-        if hass.services.has_service(DOMAIN, SERVICE_UNBYPASS_SENSOR):
-            hass.services.async_remove(DOMAIN, SERVICE_UNBYPASS_SENSOR)
-        if hass.services.has_service(DOMAIN, SERVICE_SET_AUTO_OFF):
-            hass.services.async_remove(DOMAIN, SERVICE_SET_AUTO_OFF)
-        if hass.services.has_service(DOMAIN, SERVICE_CANCEL_AUTO_OFF):
-            hass.services.async_remove(DOMAIN, SERVICE_CANCEL_AUTO_OFF)
+    # LOADED, not merely present: async_entries() includes disabled and ignored
+    # entries, which have no hub and cannot serve these services. Counting them
+    # keeps the services registered against the hub closed three lines above.
+    remaining = [
+        e
+        for e in hass.config_entries.async_entries(DOMAIN)
+        if e.entry_id != config_entry.entry_id and e.state is ConfigEntryState.LOADED
+    ]
+    if not remaining:
+        for service in (
+            SERVICE_BYPASS_SENSOR, SERVICE_UNBYPASS_SENSOR, SERVICE_SET_AUTO_OFF,
+            SERVICE_CANCEL_AUTO_OFF, SERVICE_SET_TEMPORARY_ACCESS, SERVICE_GET_TEMPORARY_USER_SCHEDULE,
+        ):
+            if hass.services.has_service(DOMAIN, service):
+                hass.services.async_remove(DOMAIN, service)
 
     return unload_success

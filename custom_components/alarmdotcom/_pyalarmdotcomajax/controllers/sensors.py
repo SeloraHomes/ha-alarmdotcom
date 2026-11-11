@@ -123,6 +123,16 @@ class SensorController(BaseController[Sensor]):
                 case ResourceEventType.DoorLeftOpenRestoral:
                     state = SensorState.CLOSED
 
+            # Preserve our glass-break restoral handling from #111.
+            if (
+                state == SensorState.CLOSED
+                and adc_resource.subtype in (
+                    SensorSubtype.GLASS_BREAK_DETECTOR,
+                    SensorSubtype.PANEL_GLASS_BREAK_DETECTOR,
+                )
+            ):
+                state = SensorState.IDLE
+
             if state:
                 # Any newer event supersedes a pulse still waiting to settle -
                 # without this, an OpenedClosed immediately followed by a real
@@ -145,6 +155,9 @@ class SensorController(BaseController[Sensor]):
                         else SensorState.CLOSED,
                         adc_resource.api_resource,
                     )
+                    # The settle assumes the sensor ended closed. Ask Alarm.com once the pulse has played out,
+                    # so a sensor that was reopened (or never closed) does not sit on an assumed state.
+                    self._request_reconcile("opened/closed event")
 
             #
             # BYPASS UPDATES

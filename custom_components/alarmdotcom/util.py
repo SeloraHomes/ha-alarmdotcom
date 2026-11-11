@@ -2,12 +2,11 @@
 
 from typing import TYPE_CHECKING
 
-from homeassistant.helpers.device_registry import (
-    DeviceEntryType,
-    async_entries_for_config_entry,
-)
-from homeassistant.helpers.device_registry import async_get as async_get_device_registry
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_registry import async_get as async_get_entity_registry
+
+from .const import DOMAIN
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -39,16 +38,13 @@ async def cleanup_orphaned_entities_and_devices(
 
     """
     entity_registry = async_get_entity_registry(hass)
-    device_registry = async_get_device_registry(hass)
 
     # Remove orphaned entities for this platform.
     # An entity is orphaned when NEITHER its entity_id NOR its unique_id is
     # present in the current set. Entities without a unique_id are matched
     # solely by entity_id — we must not delete them just because unique_id is absent.
     for entry in list(entity_registry.entities.values()):
-        if entry.config_entry_id != config_entry.entry_id:
-            continue
-        if entry.domain != platform:
+        if entry.config_entry_id != config_entry.entry_id or entry.domain != platform:
             continue
 
         matched_by_entity_id = entry.entity_id in current_entity_ids
@@ -57,23 +53,41 @@ async def cleanup_orphaned_entities_and_devices(
         if not matched_by_entity_id and not matched_by_unique_id:
             entity_registry.async_remove(entry.entity_id)
 
-    # Remove orphaned devices with no entities left, but skip SERVICE devices.
-    # async_entries_for_config_entry rather than device_registry.devices, whose mapping
-    # interface is deprecated and stops working in HA Core 2027.9. The helper already
-    # narrows to devices this entry touches; the check below keeps only those it owns
-    # outright, which is the same set the previous full scan selected.
-    for device in list(
-        async_entries_for_config_entry(device_registry, config_entry.entry_id)
-    ):
+    # Device removal must not run from individual platform setup. During a
+    # reload, other platforms may not have registered their entities yet.
+    # cleanup_orphaned_devices runs once all platforms are set up.
+
+
+def cleanup_orphaned_devices(
+    hass: "HomeAssistant",
+    config_entry: "ConfigEntry",
+    current_resource_ids: set[str],
+) -> None:
+    """
+    Remove devices this entry owns that no longer have any entity.
+
+    Run once, after every platform has been set up: per-platform setup cannot
+    do it, because during a reload the other platforms have not re-registered
+    their entities yet. The runtime RESOURCE_DELETED handler only sees
+    deletions while the integration is running; this catches devices removed
+    at Alarm.com while Home Assistant was down.
+
+    A device is kept if Alarm.com still lists it, if it is a service device,
+    if another integration shares it, or if another device names it as parent.
+    """
+    device_registry = dr.async_get(hass)
+    entity_registry = async_get_entity_registry(hass)
+    devices = dr.async_entries_for_config_entry(device_registry, config_entry.entry_id)
+    parent_ids = {device.via_device_id for device in devices if device.via_device_id}
+
+    for device in devices:
         if (
-            device.config_entries == {config_entry.entry_id}
-            and device.entry_type != DeviceEntryType.SERVICE
+            device.config_entries != {config_entry.entry_id}
+            or device.entry_type == dr.DeviceEntryType.SERVICE
+            or device.id in parent_ids
+            or any(domain == DOMAIN and ident in current_resource_ids for domain, ident in device.identifiers)
         ):
-            device_entities = [
-                e for e in entity_registry.entities.values() if e.device_id == device.id
-            ]
-            # No entities at all, or only unidentified entities on this platform
-            if not device_entities or all(
-                e.domain == platform and not e.unique_id for e in device_entities
-            ):
-                device_registry.async_remove_device(device.id)
+            continue
+        if er.async_entries_for_device(entity_registry, device.id, include_disabled_entities=True):
+            continue
+        device_registry.async_remove_device(device.id)

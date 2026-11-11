@@ -7,7 +7,7 @@ from abc import abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, NotRequired, TypedDict, TypeVar
 
 import _pyalarmdotcomajax as pyadc
 from homeassistant.core import callback
@@ -55,7 +55,9 @@ def entity_name_fn(hub: AlarmHub, resource_id: str, entity_suffix: str | None) -
 def available_fn(hub: AlarmHub, resource_id: str) -> bool:
     """Check if device is available."""
 
-    resource = hub.api.managed_devices[resource_id]
+    # Gone from Alarm.com: its entities are about to be removed, and until then they are simply unavailable.
+    if (resource := hub.api.managed_devices.get(resource_id)) is None:
+        return False
 
     return (
         hub.available
@@ -66,6 +68,17 @@ def available_fn(hub: AlarmHub, resource_id: str) -> bool:
             or resource.attributes.state.name != "UNKNOWN"
         )
     )
+
+
+class _DeviceInfoKwargs(TypedDict):
+    """Constructor fields shared by dictionary and dataclass DeviceInfo APIs."""
+
+    identifiers: set[tuple[str, str]]
+    name: str | None
+    connections: set[tuple[str, str]]
+    manufacturer: str | None
+    model: str | None
+    via_device_id: NotRequired[str]
 
 
 @callback
@@ -87,17 +100,14 @@ def device_info_fn(hub: AlarmHub, resource_id: str, entity_name: str | None) -> 
     if entity_name:
         return DeviceInfo(identifiers={(DOMAIN, resource.id)})
 
-    device_info = DeviceInfo(identifiers={(DOMAIN, resource_id)}, name=resource.name)
-
-    if resource.attributes.mac_address:
-        device_info["connections"] = {(CONNECTION_NETWORK_MAC, resource.attributes.mac_address)}
-    else:
-        device_info["connections"] = set()
-
-    if resource.attributes.manufacturer is not None:
-        device_info["manufacturer"] = resource.attributes.manufacturer
-    if resource.attributes.device_model is not None:
-        device_info["model"] = resource.attributes.device_model
+    # Collect constructor arguments separately so optional fields can be omitted.
+    # This also avoids mutating DeviceInfo if it becomes a dataclass.
+    connections = (
+        {(CONNECTION_NETWORK_MAC, resource.attributes.mac_address)}
+        if resource.attributes.mac_address else set()
+    )
+    manufacturer = resource.attributes.manufacturer
+    model = resource.attributes.device_model
 
     # Determine parent device candidate (prefer system device). This is the parent's
     # Alarm.com resource id, i.e. the second half of its (DOMAIN, ...) identifier - not
@@ -118,6 +128,8 @@ def device_info_fn(hub: AlarmHub, resource_id: str, entity_name: str | None) -> 
             else:
                 parent_resource_id = system_id
 
+    parent_device_id: str | None = None
+
     # Only publish the parent link when the referenced device actually exists, and publish
     # it as the parent's registry id. async_get_device_by_identifier scopes the lookup to
     # this config entry, where identifiers are unique, so the match cannot be ambiguous.
@@ -127,9 +139,18 @@ def device_info_fn(hub: AlarmHub, resource_id: str, entity_name: str | None) -> 
             (DOMAIN, parent_resource_id), hub.config_entry.entry_id
         )
         if parent_device is not None:
-            device_info["via_device_id"] = parent_device.id
+            parent_device_id = parent_device.id
 
-    return device_info
+    device_info_kwargs: _DeviceInfoKwargs = {
+        "identifiers": {(DOMAIN, resource_id)},
+        "name": resource.name,
+        "connections": connections,
+        "manufacturer": manufacturer,
+        "model": model,
+    }
+    if parent_device_id is not None:
+        device_info_kwargs["via_device_id"] = parent_device_id
+    return DeviceInfo(**device_info_kwargs)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -173,6 +194,7 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
 
     entity_description: AdcEntityDescription[AdcManagedDeviceT, AdcControllerT]
     controller: AdcControllerT
+    _removal_requested: bool = False
 
     def __init__(
         self,
@@ -235,14 +257,28 @@ class AdcEntity(Entity, Generic[AdcManagedDeviceT, AdcControllerT]):
     async def remove(self) -> None:
         """Remove entity from Home Assistant."""
 
-        if self.registry_entry:
-            er.async_get(self.hass).async_remove(self.entity_id)
-        else:
+        if self._removal_requested:
+            return
+        self._removal_requested = True
+
+        if not self.registry_entry:
             await self.async_remove(force_remove=True)
+            return
+
+        registry = er.async_get(self.hass)
+        # The hub removes a deleted resource's whole device, which takes this registry entry (and this entity) with
+        # it. Removing an entry that is already gone raises.
+        if registry.async_get(self.entity_id) is not None:
+            registry.async_remove(self.entity_id)
 
     @callback
     def event_handler(self, message: pyadc.EventBrokerMessage) -> None:
         """Handle event message."""
+
+        if self.resource_id not in self.hub.api.managed_devices:
+            # Deleted, or the delete was missed: every handler below reads the resource and would raise.
+            self.hass.async_create_task(self.remove())
+            return
 
         if message.topic in [
             pyadc.EventBrokerTopic.RESOURCE_ADDED,
