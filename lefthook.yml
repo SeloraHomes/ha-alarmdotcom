@@ -45,8 +45,8 @@ pre-commit:
       run: for f in {staged_files}; do python3 -m json.tool "$f" > /dev/null || exit 1; done
 
     - name: whitespace
-      # Trailing whitespace and leftover conflict markers.
-      run: git diff --cached --check
+      # Trailing whitespace, blank lines at EOF and leftover conflict markers.
+      run: python3 scripts/check_whitespace.py {staged_files}
 
 commit-msg:
   jobs:

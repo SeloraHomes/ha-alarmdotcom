@@ -230,4 +230,3 @@ class SensorController(BaseController[Sensor]):
         )
 
         await self._register_or_update_resource(adc_resource.api_resource)
-
