@@ -58,6 +58,15 @@ async def cleanup_orphaned_entities_and_devices(
     # cleanup_orphaned_devices runs once all platforms are set up.
 
 
+def _owned_by_other_entry(device: dr.DeviceEntry, entry_id: str) -> bool:
+    """Return True if a config entry other than ``entry_id`` also owns the device."""
+    # Newer Home Assistant gives each device one config entry and deprecates
+    # DeviceEntry.config_entries; older releases (still supported) only have that set.
+    if hasattr(device, "config_entry_id"):
+        return device.config_entry_id != entry_id
+    return device.config_entries != {entry_id}
+
+
 def cleanup_orphaned_devices(
     hass: "HomeAssistant",
     config_entry: "ConfigEntry",
@@ -82,7 +91,7 @@ def cleanup_orphaned_devices(
 
     for device in devices:
         if (
-            device.config_entries != {config_entry.entry_id}
+            _owned_by_other_entry(device, config_entry.entry_id)
             or device.entry_type == dr.DeviceEntryType.SERVICE
             or device.id in parent_ids
             or any(domain == DOMAIN and ident in current_resource_ids for domain, ident in device.identifiers)
