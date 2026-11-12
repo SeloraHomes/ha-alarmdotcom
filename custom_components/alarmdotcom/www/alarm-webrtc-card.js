@@ -486,8 +486,38 @@ class AlarmWebRTCCard extends HTMLElement {
     // URL voids the whole iceServers list.
     const m = /^(stuns?|turns?):(\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::(\d{1,5}))?(\?transport=(?:udp|tcp))?$/i.exec(url);
     if (!m) return false;
+    if (m[2].startsWith("[")) {
+      // Let the platform's URL parser decide whether the IPv6 literal is valid.
+      try {
+        new URL(`http://${m[2]}/`);
+      } catch {
+        return false;
+      }
+    }
     if (m[4] && !/^turns?$/i.test(m[1])) return false;
     return m[3] === undefined || (Number(m[3]) >= 1 && Number(m[3]) <= 65535);
+  }
+
+  _applyIceServers(pc, servers) {
+    // Validation is a first pass only. If the browser still rejects the list,
+    // add the servers back one at a time and keep each one it accepts, so a
+    // single entry it dislikes can never discard the working TURN servers.
+    const base = pc.getConfiguration();
+    try {
+      pc.setConfiguration({ ...base, iceServers: servers });
+      return servers.length;
+    } catch (e) {}
+    const accepted = [];
+    for (const server of servers) {
+      try {
+        pc.setConfiguration({ ...base, iceServers: [...accepted, server] });
+        accepted.push(server);
+      } catch (e) {}
+    }
+    try {
+      pc.setConfiguration({ ...base, iceServers: accepted });
+    } catch (e) {}
+    return accepted.length;
   }
 
   _validIceServers(list) {
@@ -583,15 +613,11 @@ class AlarmWebRTCCard extends HTMLElement {
         // the answer is sent, and the video stays black.
         const servers = this._sessionIceServers(msg.data);
         if (servers.length) {
-          try {
-            pc.setConfiguration({
-              ...pc.getConfiguration(),
-              iceServers: [...this._validIceServers(config.iceServers), ...servers],
-            });
-            this._log("Legacy ICE servers from session", servers.length);
-          } catch (e) {
-            this._log("Failed to apply session ICE servers", e);
-          }
+          const applied = this._applyIceServers(pc, [
+            ...this._validIceServers(config.iceServers),
+            ...servers,
+          ]);
+          this._log("Legacy ICE servers from session", applied);
         }
         return;
       }

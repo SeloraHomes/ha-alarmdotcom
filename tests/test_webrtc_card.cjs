@@ -10,7 +10,7 @@ function loadCard() {
   let Card;
   const document = {};
   const context = {
-    HTMLElement: class {}, document, console,
+    HTMLElement: class {}, document, console, URL,
     setTimeout: (fn) => { timers.set(++serial, fn); return serial; },
     clearTimeout: (id) => timers.delete(id),
     clearInterval: () => {},
@@ -344,6 +344,7 @@ test("ICE URLs must follow the stun/turn URI syntax", () => {
     "stun://example.org/foo?x=y", "turn://ice.example.test:3478", "stun:ice.example.test/path",
     "stun:ice.example.test?transport=udp", "turn:ice.example.test?transport=sctp", "stun:ice.example.test:0",
     "stun:ice.example.test:70000", "stun:", "stun:-bad.example", "stun:ice example.test",
+    "stun:[::::]", "turn:[1::2::3]:3478",
   ];
   for (const u of ok) assert.equal(card.constructor._isIceUrl(u), true, u);
   for (const u of bad) assert.equal(card.constructor._isIceUrl(u), false, u);
@@ -352,4 +353,29 @@ test("ICE URLs must follow the stun/turn URI syntax", () => {
     JSON.parse(JSON.stringify(card._validIceServers([{ urls: ["stun://example.org/foo?x=y"] }, turn]))),
     [turn],
   );
+});
+
+test("an invalid IPv6 STUN URL cannot void a valid TURN server", () => {
+  const { card } = loadCard();
+  const turn = { urls: ["turn:ice.example.test:3478"], username: "u", credential: "p" };
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(card._validIceServers([{ urls: ["stun:[::::]"] }, turn]))),
+    [turn],
+  );
+});
+
+test("servers the browser still rejects are dropped one by one, keeping the rest", () => {
+  const { card } = loadCard();
+  const pc = {
+    cfg: { bundlePolicy: "max-bundle", iceServers: [] },
+    getConfiguration() { return this.cfg; },
+    setConfiguration(cfg) {
+      if (cfg.iceServers.some((s) => s.urls[0].includes("rejected"))) throw new Error("SyntaxError");
+      this.cfg = cfg;
+    },
+  };
+  const stun = { urls: ["stun:ice.example.test:3478"] };
+  const turn = { urls: ["turn:ice.example.test:3478"], username: "u", credential: "p" };
+  assert.equal(card._applyIceServers(pc, [stun, { urls: ["stun:rejected.example.test"] }, turn]), 2);
+  assert.deepEqual(JSON.parse(JSON.stringify(pc.cfg)), { bundlePolicy: "max-bundle", iceServers: [stun, turn] });
 });
