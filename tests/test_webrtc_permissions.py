@@ -28,3 +28,20 @@ async def test_webrtc_credentials_require_camera_permission(hass, allowed):
         camera.async_get_webrtc_config.assert_not_awaited()
         connection.send_result.assert_not_called()
         connection.send_error.assert_called_once_with(1, "unauthorized", "Camera access denied")
+
+
+async def test_camera_without_live_view_gets_a_distinct_error(hass):
+    """The card needs a code it can stop on, not a generic retryable failure."""
+    camera = MagicMock(live_view_supported=False)
+    camera.async_get_webrtc_config = AsyncMock()
+    hass.data[DOMAIN + "_camera_entities"] = {"camera.doorbell": camera}
+    connection = MagicMock()
+    connection.user.permissions.check_entity.return_value = True
+
+    async_get_webrtc_config(hass, connection, {"id": 1, "entity_id": "camera.doorbell"})
+    await hass.async_block_till_done()
+
+    camera.async_get_webrtc_config.assert_not_awaited()
+    connection.send_error.assert_called_once_with(
+        1, "live_view_unsupported", "Live view isn't available for this camera"
+    )

@@ -379,3 +379,29 @@ test("servers the browser still rejects are dropped one by one, keeping the rest
   assert.equal(card._applyIceServers(pc, [stun, { urls: ["stun:rejected.example.test"] }, turn]), 2);
   assert.deepEqual(JSON.parse(JSON.stringify(pc.cfg)), { bundlePolicy: "max-bundle", iceServers: [stun, turn] });
 });
+
+test("a camera without live view shows a message once and stops retrying", async () => {
+  const { card, timers } = loadCard();
+  let shown = "";
+  card.renderPlaceholder = (msg) => { shown = msg; };
+  card.config = { entity: "camera.doorbell" };
+  card._entityId = "camera.doorbell";
+  let requests = 0;
+  card._hass = {
+    connection: {
+      sendMessagePromise: () => {
+        requests++;
+        return Promise.reject({ code: "live_view_unsupported", message: "Live view isn't available for this camera" });
+      },
+    },
+  };
+  card._requestTokens("No valid config");
+  await new Promise((r) => setImmediate(r));
+  assert.equal(shown, "Live view isn't available for this camera");
+  assert.equal(card._liveViewUnsupported, true);
+  assert.equal(card._retryCount, 0);
+  assert.equal(card._requesting, false);
+  // Only the request timeout was armed, and it was cleared; no retry is queued.
+  assert.equal(card._retryTimer, null);
+  assert.equal(requests, 1);
+});

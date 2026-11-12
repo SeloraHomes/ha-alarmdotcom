@@ -36,6 +36,13 @@ async def async_get_webrtc_config(hass: HomeAssistant, connection: ActiveConnect
         connection.send_error(msg["id"], "not_found", "Alarm.com camera not found")
         return
 
+    if not camera.live_view_supported:
+        # A distinct code lets the card say so instead of retrying forever.
+        connection.send_error(
+            msg["id"], "live_view_unsupported", "Live view isn't available for this camera"
+        )
+        return
+
     try:
         config = await camera.async_get_webrtc_config()
     except Exception:
