@@ -119,6 +119,11 @@ class AlarmDotComCamera(Camera):
         self._entry_id = entry_id
         self._token_refresh_interval = token_refresh_interval
 
+        # Some models (e.g. SkyBell HD doorbells) have no live view through
+        # Alarm.com: asking for stream info only returns errorEnum 14. Only an
+        # explicit False counts; older payloads may omit the field.
+        self.live_view_supported = info.get("supportsLiveView") is not False
+
         self._attr_unique_id = f"{entry_id}_camera_{self._id}"
         self._attr_name = self._name
         self._webrtc_config: dict | None = None
@@ -139,6 +144,13 @@ class AlarmDotComCamera(Camera):
         """Start periodic token refresh when entity is added."""
         await super().async_added_to_hass()
         self.hass.data.setdefault(DOMAIN + '_camera_entities', {})[self.entity_id] = self
+
+        if not self.live_view_supported:
+            _LOGGER.info(
+                "Alarm.com reports no live view for camera %s; not fetching stream tokens.",
+                self._id,
+            )
+            return
 
         await self._fetch_stream_info()
 
@@ -266,6 +278,8 @@ class AlarmDotComCamera(Camera):
         stream. Dashboard reconnects must not depend on the periodic refresh.
         Concurrent callers share a fetch already in progress for this camera.
         """
+        if not self.live_view_supported:
+            return None
         await self._fetch_stream_info()
         return self._webrtc_config
 
@@ -282,6 +296,8 @@ class AlarmDotComCamera(Camera):
 
     async def async_turn_on(self) -> None:
         """Fetch fresh WebRTC tokens on demand."""
+        if not self.live_view_supported:
+            return
         await self._fetch_stream_info()
 
     async def async_turn_off(self) -> None:

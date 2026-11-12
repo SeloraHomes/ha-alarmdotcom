@@ -156,6 +156,7 @@ class AlarmWebRTCCard extends HTMLElement {
     this._entityId = config.entity;
     this._requestSerial += 1;
     this._secureConfig = null;
+    this._liveViewUnsupported = false;
     this._log("setConfig");
   }
 
@@ -195,6 +196,7 @@ class AlarmWebRTCCard extends HTMLElement {
     );
 
     if (!isValid) {
+      if (this._liveViewUnsupported) return;
       if (!this._requesting && !this._connecting && !this._retryTimer && this._retryCount < this._maxRetries) {
         this._requestTokens("No valid config");
       }
@@ -372,11 +374,19 @@ class AlarmWebRTCCard extends HTMLElement {
       }
       this._secureConfig = config;
       this.hass = this._hass;
-    }).catch(() => {
+    }).catch((err) => {
       if (this.config.entity !== requestEntity || requestSerial !== this._requestSerial) return;
       clearTimeout(this._requestTimeout);
-      this._log("WebRTC credential request failed");
       this._requesting = false;
+      if (err?.code === "live_view_unsupported") {
+        // Permanent: Alarm.com has no live view for this model. Say so once
+        // instead of cycling through retries that cannot succeed.
+        this._log("Live view not supported by this camera");
+        this._liveViewUnsupported = true;
+        this.renderPlaceholder("Live view isn't available for this camera");
+        return;
+      }
+      this._log("WebRTC credential request failed");
       this._scheduleRetry("Credential request failed");
     });
 

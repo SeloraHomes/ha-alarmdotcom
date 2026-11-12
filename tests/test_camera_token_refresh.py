@@ -98,3 +98,30 @@ async def test_failed_reconnect_does_not_return_old_credentials(hass: HomeAssist
     else:
         camera._session.get_stream_info = AsyncMock(return_value=result)
     assert await camera.async_get_webrtc_config() is None
+
+
+@pytest.mark.parametrize(("flag", "supported"), [(False, False), (True, True), (None, True)])
+async def test_live_view_flag_only_disables_on_explicit_false(hass: HomeAssistant, flag, supported) -> None:
+    """Only an explicit supportsLiveView=False turns streaming off; a missing field does not."""
+    info = {"id": "cam-1", "description": "Doorbell"}
+    if flag is not None:
+        info["supportsLiveView"] = flag
+    camera = AlarmDotComCamera(MagicMock(), info, "entry", timedelta(minutes=30))
+    assert camera.live_view_supported is supported
+
+
+async def test_camera_without_live_view_never_requests_stream_tokens(hass: HomeAssistant) -> None:
+    """ErrorEnum 14 cameras must not be polled for tokens they will never get."""
+    session = MagicMock()
+    session.get_stream_info = AsyncMock()
+    camera = AlarmDotComCamera(
+        session, {"id": "cam-1", "description": "Doorbell", "supportsLiveView": False}, "entry", timedelta(minutes=30)
+    )
+    camera.hass = hass
+    camera.entity_id = "camera.doorbell"
+    camera.async_write_ha_state = MagicMock()
+    await camera.async_added_to_hass()
+    await camera.async_turn_on()
+    assert await camera.async_get_webrtc_config() is None
+    session.get_stream_info.assert_not_awaited()
+    assert camera._remove_refresh is None
