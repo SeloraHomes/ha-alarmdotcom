@@ -466,8 +466,8 @@ class AlarmWebRTCCard extends HTMLElement {
   }
 
   _sessionIceServers(message) {
-    // "SESSION_STARTED {json}": collect iceServers and tlsTurnServers entries
-    // that look like RTCIceServer objects, and ignore anything malformed.
+    // "SESSION_STARTED {json}": collect the iceServers and tlsTurnServers
+    // entries, keeping only valid ones (see _validIceServers).
     let payload;
     try {
       payload = JSON.parse(message.slice(message.indexOf(" ") + 1));
@@ -475,15 +475,35 @@ class AlarmWebRTCCard extends HTMLElement {
       return [];
     }
     if (!payload || typeof payload !== "object") return [];
-    return [payload.iceServers, payload.tlsTurnServers]
-      .filter(Array.isArray)
-      .flat()
-      .filter(
-        (s) =>
-          s &&
-          typeof s === "object" &&
-          (typeof s.urls === "string" || (Array.isArray(s.urls) && s.urls.length))
+    return this._validIceServers(
+      [payload.iceServers, payload.tlsTurnServers].filter(Array.isArray).flat()
+    );
+  }
+
+  _validIceServers(list) {
+    // setConfiguration() rejects the whole list if any one entry is invalid,
+    // which would silently drop the good TURN servers too. Keep only URLs
+    // with an ICE scheme, and TURN URLs only when credentials are present.
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const s of list) {
+      if (!s || typeof s !== "object") continue;
+      const hasCreds = typeof s.username === "string" && typeof s.credential === "string";
+      const urls = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter(
+        (u) =>
+          typeof u === "string" &&
+          /^(stuns?|turns?):\S+$/i.test(u) &&
+          (hasCreds || !/^turns?:/i.test(u))
       );
+      if (!urls.length) continue;
+      const entry = { urls };
+      if (hasCreds) {
+        entry.username = s.username;
+        entry.credential = s.credential;
+      }
+      out.push(entry);
+    }
+    return out;
   }
 
   async _startLegacy(config) {
@@ -556,7 +576,7 @@ class AlarmWebRTCCard extends HTMLElement {
           try {
             pc.setConfiguration({
               ...pc.getConfiguration(),
-              iceServers: [...(config.iceServers || []), ...servers],
+              iceServers: [...this._validIceServers(config.iceServers), ...servers],
             });
             this._log("Legacy ICE servers from session", servers.length);
           } catch (e) {

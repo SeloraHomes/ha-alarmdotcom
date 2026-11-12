@@ -268,8 +268,25 @@ test("malformed session ICE servers are ignored", () => {
   assert.equal(card._sessionIceServers("SESSION_STARTED null").length, 0);
   assert.deepEqual(
     JSON.parse(JSON.stringify(card._sessionIceServers(`SESSION_STARTED ${JSON.stringify({ iceServers: [null, {}, { urls: [] }, { urls: "stun:a" }], tlsTurnServers: "x" })}`))),
-    [{ urls: "stun:a" }],
+    [{ urls: ["stun:a"] }],
   );
+});
+
+test("invalid ICE entries are dropped so they cannot void the valid TURN servers", () => {
+  const { card } = loadCard();
+  const turn = { urls: ["turn:ice.example.test:3478"], username: "u", credential: "p" };
+  const servers = card._validIceServers([
+    { urls: "" },
+    { urls: ["not-a-url", "stun:ice.example.test:3478"] },
+    { urls: ["turn:nocreds.example.test:3478"] },
+    { urls: ["turns:ice.example.test:443?transport=tcp"], username: "u" },
+    { urls: [42, "http://ice.example.test"] },
+    turn,
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(servers)), [
+    { urls: ["stun:ice.example.test:3478"] },
+    turn,
+  ]);
 });
 
 test("debug log prints states and counts but never URLs or objects", () => {
