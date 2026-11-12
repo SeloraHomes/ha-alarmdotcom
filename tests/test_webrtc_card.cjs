@@ -333,3 +333,23 @@ test("ICE failure rebuilds the stream immediately", () => {
   assert.equal(retries, 1);
   assert.equal(card.pc, null);
 });
+
+test("ICE URLs must follow the stun/turn URI syntax", () => {
+  const { card } = loadCard();
+  const ok = [
+    "stun:ice.example.test", "stun:ice.example.test:3478", "stuns:ice.example.test:5349",
+    "turn:10.0.0.1:3478?transport=udp", "turns:ice.example.test:443?transport=tcp", "stun:[2001:db8::1]:3478",
+  ];
+  const bad = [
+    "stun://example.org/foo?x=y", "turn://ice.example.test:3478", "stun:ice.example.test/path",
+    "stun:ice.example.test?transport=udp", "turn:ice.example.test?transport=sctp", "stun:ice.example.test:0",
+    "stun:ice.example.test:70000", "stun:", "stun:-bad.example", "stun:ice example.test",
+  ];
+  for (const u of ok) assert.equal(card.constructor._isIceUrl(u), true, u);
+  for (const u of bad) assert.equal(card.constructor._isIceUrl(u), false, u);
+  const turn = { urls: ["turn:ice.example.test:3478"], username: "u", credential: "p" };
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(card._validIceServers([{ urls: ["stun://example.org/foo?x=y"] }, turn]))),
+    [turn],
+  );
+});

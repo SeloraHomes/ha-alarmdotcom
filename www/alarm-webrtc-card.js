@@ -480,6 +480,16 @@ class AlarmWebRTCCard extends HTMLElement {
     );
   }
 
+  static _isIceUrl(url) {
+    // RFC 7064/7065: stun[s]:host[:port] and turn[s]:host[:port][?transport=udp|tcp].
+    // No "//", path or other query: browsers reject those, and one rejected
+    // URL voids the whole iceServers list.
+    const m = /^(stuns?|turns?):(\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::(\d{1,5}))?(\?transport=(?:udp|tcp))?$/i.exec(url);
+    if (!m) return false;
+    if (m[4] && !/^turns?$/i.test(m[1])) return false;
+    return m[3] === undefined || (Number(m[3]) >= 1 && Number(m[3]) <= 65535);
+  }
+
   _validIceServers(list) {
     // setConfiguration() rejects the whole list if any one entry is invalid,
     // which would silently drop the good TURN servers too. Keep only URLs
@@ -492,7 +502,7 @@ class AlarmWebRTCCard extends HTMLElement {
       const urls = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter(
         (u) =>
           typeof u === "string" &&
-          /^(stuns?|turns?):\S+$/i.test(u) &&
+          AlarmWebRTCCard._isIceUrl(u) &&
           (hasCreds || !/^turns?:/i.test(u))
       );
       if (!urls.length) continue;
