@@ -238,3 +238,81 @@ test("Apple SDP patch normalises and adds H.264 profile-level-id per payload typ
   ].join("\r\n"));
   assert.equal(card._patchAppleOfferSdp(""), "");
 });
+
+test("end-to-end session ICE servers are applied before the offer is answered", async () => {
+  const { card, context } = loadCard();
+  let pc;
+  context.RTCPeerConnection = class {
+    constructor(cfg) { pc = this; this.cfg = cfg; }
+    getConfiguration() { return this.cfg; }
+    setConfiguration(cfg) { this.cfg = cfg; }
+    close() {}
+  };
+  let socket;
+  context.WebSocket = class { constructor() { socket = this; } send() {} close() {} };
+  card.querySelector = () => ({});
+  const config = { signallingServerUrl: "wss://example.test", signallingServerToken: "t", cameraAuthToken: "c", iceServers: [] };
+  card._currentConfig = config;
+  await card._startLegacy(config);
+  const stun = { urls: ["stun:ice.example.test:3478"] };
+  const turn = { urls: ["turn:ice.example.test:3478"], username: "u", credential: "p" };
+  const turns = { urls: ["turns:ice.example.test:443?transport=tcp"], username: "u", credential: "p" };
+  await socket.onmessage({ data: `SESSION_STARTED ${JSON.stringify({ sessionId: "s", iceServers: [stun, turn], tlsTurnServers: [turns] })}` });
+  assert.deepEqual(JSON.parse(JSON.stringify(pc.cfg.iceServers)), [stun, turn, turns]);
+});
+
+test("malformed session ICE servers are ignored", () => {
+  const { card } = loadCard();
+  assert.equal(card._sessionIceServers("SESSION_STARTED").length, 0);
+  assert.equal(card._sessionIceServers("SESSION_STARTED not-json").length, 0);
+  assert.equal(card._sessionIceServers("SESSION_STARTED null").length, 0);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(card._sessionIceServers(`SESSION_STARTED ${JSON.stringify({ iceServers: [null, {}, { urls: [] }, { urls: "stun:a" }], tlsTurnServers: "x" })}`))),
+    [{ urls: "stun:a" }],
+  );
+});
+
+test("debug log prints states and counts but never URLs or objects", () => {
+  const { card, context } = loadCard();
+  const lines = [];
+  context.console = { debug: (...a) => lines.push(a) };
+  card.config = { debug: true };
+  card._log("Janus ICE state", "connected");
+  card._log("Trying Janus WS URL", "wss://gw.example.test/?token=secret");
+  card._log("stats", 30, 2, { secret: "x" });
+  assert.deepEqual(JSON.parse(JSON.stringify(lines.map((l) => l.slice(1)))), [
+    ["Janus ICE state", "connected"],
+    ["Trying Janus WS URL"],
+    ["stats", 30, 2],
+  ]);
+});
+
+test("a transient ICE disconnect keeps the stream; a lasting one rebuilds it", () => {
+  const { card, timers } = loadCard();
+  let closed = 0, retries = 0;
+  const pc = { iceConnectionState: "disconnected", close: () => { closed++; } };
+  card.pc = pc;
+  card._scheduleRetry = () => { retries++; };
+  const gen = card._streamGeneration;
+  card._onIceState(pc, gen, "Janus");
+  assert.equal(closed, 0);
+  pc.iceConnectionState = "connected";
+  card._onIceState(pc, gen, "Janus");
+  assert.equal(timers.size, 0, "recovery cancels the grace timer");
+  pc.iceConnectionState = "disconnected";
+  card._onIceState(pc, gen, "Janus");
+  [...timers.values()][0]();
+  assert.equal(closed, 1);
+  assert.equal(retries, 1);
+});
+
+test("ICE failure rebuilds the stream immediately", () => {
+  const { card } = loadCard();
+  let retries = 0;
+  const pc = { iceConnectionState: "failed", close() {} };
+  card.pc = pc;
+  card._scheduleRetry = () => { retries++; };
+  card._onIceState(pc, card._streamGeneration, "Legacy");
+  assert.equal(retries, 1);
+  assert.equal(card.pc, null);
+});
