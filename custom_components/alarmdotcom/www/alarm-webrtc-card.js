@@ -1,6 +1,9 @@
 // Alarm.com WebRTC card: tokens are retrieved over authenticated HA websocket.
 
 class AlarmWebRTCCard extends HTMLElement {
+  // ICE "disconnected" usually recovers by itself; only rebuild if it lasts this long.
+  static ICE_DISCONNECT_GRACE_MS = 8000;
+
   constructor() {
     super();
     this._connected = false;
@@ -25,7 +28,72 @@ class AlarmWebRTCCard extends HTMLElement {
 
   _log(...args) {
     // Never print stream configuration, tokens, or signaling payloads.
-    if (this.config?.debug) console.debug(`[AlarmWebRTC ${this._entityId || "unknown"}]`, args.length ? String(args[0]) : "event");
+    if (!this.config?.debug) return;
+    // Extra arguments are printed only when they are plain states or counts
+    // (e.g. "connected", 3): URLs, objects and errors may carry credentials.
+    const safe = args
+      .slice(1)
+      .filter((a) => typeof a === "number" || (typeof a === "string" && /^[a-z][a-z-]{0,23}$/.test(a)));
+    console.debug(`[AlarmWebRTC ${this._entityId || "unknown"}]`, args.length ? String(args[0]) : "event", ...safe);
+  }
+
+  _onIceState(pc, generation, label) {
+    // "disconnected" is usually transient (a few missed connectivity checks)
+    // and the browser often recovers on its own. Tearing down at once turns
+    // every glitch into a full reconnect and a black gap until the next
+    // keyframe, so give it a grace period; "failed" and "closed" are final.
+    const s = pc.iceConnectionState;
+    if (s === "connected" || s === "completed") {
+      clearTimeout(this._iceGraceTimer);
+      this._iceGraceTimer = null;
+      return;
+    }
+    if (s === "failed" || s === "closed") {
+      this._teardownStream(false);
+      this._scheduleRetry(`${label} ICE ${s}`);
+      return;
+    }
+    if (s === "disconnected" && !this._iceGraceTimer) {
+      this._iceGraceTimer = setTimeout(() => {
+        this._iceGraceTimer = null;
+        if (generation !== this._streamGeneration || this.pc !== pc) return;
+        if (pc.iceConnectionState !== "disconnected") return;
+        this._log(`${label} ICE did not recover`);
+        this._teardownStream(false);
+        this._scheduleRetry(`${label} ICE disconnected`);
+      }, AlarmWebRTCCard.ICE_DISCONNECT_GRACE_MS);
+    }
+  }
+
+  _startStatsLog() {
+    // Debug only: show whether video frames are actually arriving and being
+    // decoded, which is what separates "no media" from "no keyframe yet".
+    clearInterval(this._statsTimer);
+    if (!this.config?.debug || !this.pc?.getStats) return;
+    const pc = this.pc;
+    this._statsTimer = setInterval(async () => {
+      if (this.pc !== pc) {
+        clearInterval(this._statsTimer);
+        return;
+      }
+      try {
+        const report = await pc.getStats();
+        report.forEach((r) => {
+          if (r.type === "inbound-rtp" && (r.kind || r.mediaType) === "video") {
+            this._log(
+              "video stats: received/decoded/keyframes/packets/lost/width/height",
+              r.framesReceived ?? -1,
+              r.framesDecoded ?? -1,
+              r.keyFramesDecoded ?? -1,
+              r.packetsReceived ?? -1,
+              r.packetsLost ?? -1,
+              r.frameWidth ?? -1,
+              r.frameHeight ?? -1
+            );
+          }
+        });
+      } catch (e) {}
+    }, 5000);
   }
 
   // Several Alarm.com camera models offer H.264 at a profile-level-id (e.g. 4d4028,
@@ -318,6 +386,10 @@ class AlarmWebRTCCard extends HTMLElement {
   _teardownStream(resetConfig = true) {
     // Invalidate old callbacks before closing: a late close must not kill a replacement stream.
     this._streamGeneration += 1;
+    clearInterval(this._statsTimer);
+    this._statsTimer = null;
+    clearTimeout(this._iceGraceTimer);
+    this._iceGraceTimer = null;
     if (this._janusKeepalive) {
       clearInterval(this._janusKeepalive);
       this._janusKeepalive = null;
@@ -353,6 +425,7 @@ class AlarmWebRTCCard extends HTMLElement {
   }
 
   _markConnected() {
+    this._startStatsLog();
     this._connected = true;
     this._connecting = false;
     this._requesting = false;
@@ -392,6 +465,87 @@ class AlarmWebRTCCard extends HTMLElement {
     }
   }
 
+  _sessionIceServers(message) {
+    // "SESSION_STARTED {json}": collect the iceServers and tlsTurnServers
+    // entries, keeping only valid ones (see _validIceServers).
+    let payload;
+    try {
+      payload = JSON.parse(message.slice(message.indexOf(" ") + 1));
+    } catch {
+      return [];
+    }
+    if (!payload || typeof payload !== "object") return [];
+    return this._validIceServers(
+      [payload.iceServers, payload.tlsTurnServers].filter(Array.isArray).flat()
+    );
+  }
+
+  static _isIceUrl(url) {
+    // RFC 7064/7065: stun[s]:host[:port] and turn[s]:host[:port][?transport=udp|tcp].
+    // No "//", path or other query: browsers reject those, and one rejected
+    // URL voids the whole iceServers list.
+    const m = /^(stuns?|turns?):(\[[0-9a-f:.]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?)(?::(\d{1,5}))?(\?transport=(?:udp|tcp))?$/i.exec(url);
+    if (!m) return false;
+    if (m[2].startsWith("[")) {
+      // Let the platform's URL parser decide whether the IPv6 literal is valid.
+      try {
+        new URL(`http://${m[2]}/`);
+      } catch {
+        return false;
+      }
+    }
+    if (m[4] && !/^turns?$/i.test(m[1])) return false;
+    return m[3] === undefined || (Number(m[3]) >= 1 && Number(m[3]) <= 65535);
+  }
+
+  _applyIceServers(pc, servers) {
+    // Validation is a first pass only. If the browser still rejects the list,
+    // add the servers back one at a time and keep each one it accepts, so a
+    // single entry it dislikes can never discard the working TURN servers.
+    const base = pc.getConfiguration();
+    try {
+      pc.setConfiguration({ ...base, iceServers: servers });
+      return servers.length;
+    } catch (e) {}
+    const accepted = [];
+    for (const server of servers) {
+      try {
+        pc.setConfiguration({ ...base, iceServers: [...accepted, server] });
+        accepted.push(server);
+      } catch (e) {}
+    }
+    try {
+      pc.setConfiguration({ ...base, iceServers: accepted });
+    } catch (e) {}
+    return accepted.length;
+  }
+
+  _validIceServers(list) {
+    // setConfiguration() rejects the whole list if any one entry is invalid,
+    // which would silently drop the good TURN servers too. Keep only URLs
+    // with an ICE scheme, and TURN URLs only when credentials are present.
+    if (!Array.isArray(list)) return [];
+    const out = [];
+    for (const s of list) {
+      if (!s || typeof s !== "object") continue;
+      const hasCreds = typeof s.username === "string" && typeof s.credential === "string";
+      const urls = (Array.isArray(s.urls) ? s.urls : [s.urls]).filter(
+        (u) =>
+          typeof u === "string" &&
+          AlarmWebRTCCard._isIceUrl(u) &&
+          (hasCreds || !/^turns?:/i.test(u))
+      );
+      if (!urls.length) continue;
+      const entry = { urls };
+      if (hasCreds) {
+        entry.username = s.username;
+        entry.credential = s.credential;
+      }
+      out.push(entry);
+    }
+    return out;
+  }
+
   async _startLegacy(config) {
     const generation = this._streamGeneration;
     const pc = new RTCPeerConnection({
@@ -427,10 +581,7 @@ class AlarmWebRTCCard extends HTMLElement {
       if (generation !== this._streamGeneration) return;
       const s = pc.iceConnectionState;
       this._log("Legacy ICE state", s);
-      if (s === "disconnected" || s === "failed" || s === "closed") {
-        this._teardownStream(false);
-        this._scheduleRetry(`Legacy ICE ${s}`);
-      }
+      this._onIceState(pc, generation, "Legacy");
     };
 
     const ws = new WebSocket(
@@ -456,6 +607,18 @@ class AlarmWebRTCCard extends HTMLElement {
       }
 
       if (msg.data.startsWith("SESSION_STARTED")) {
+        // End-to-end cameras get their STUN/TURN servers here, not in the
+        // REST stream info (whose iceServers is often empty). Without them
+        // the browser cannot reach a camera behind NAT: the offer arrives,
+        // the answer is sent, and the video stays black.
+        const servers = this._sessionIceServers(msg.data);
+        if (servers.length) {
+          const applied = this._applyIceServers(pc, [
+            ...this._validIceServers(config.iceServers),
+            ...servers,
+          ]);
+          this._log("Legacy ICE servers from session", applied);
+        }
         return;
       }
 
@@ -660,10 +823,7 @@ class AlarmWebRTCCard extends HTMLElement {
       if (generation !== this._streamGeneration) return;
       const s = pc.iceConnectionState;
       this._log("Janus ICE state", s);
-      if (s === "disconnected" || s === "failed" || s === "closed") {
-        this._teardownStream(false);
-        this._scheduleRetry(`Janus ICE ${s}`);
-      }
+      this._onIceState(pc, generation, "Janus");
     };
 
     const ws = await this._openJanusWebSocket(config);
